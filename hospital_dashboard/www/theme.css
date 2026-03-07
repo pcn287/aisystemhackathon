@@ -1,0 +1,321 @@
+/**
+ * Patient Digital Twin Hospital Dashboard — Theme
+ * Clinical, professional healthcare UI.
+ */
+
+:root {
+  /* Primary & surfaces */
+  --hd-primary: #0F4C81;
+  --hd-primary-hover: #0D3D6B;
+  --hd-secondary: #0284C7;
+  --hd-bg: #F5F7FA;
+  --hd-card-bg: #FFFFFF;
+  --hd-border: #E2E8F0;
+  --hd-border-subtle: #F1F5F9;
+
+  /* Text */
+  --hd-text: #1E293B;
+  --hd-text-secondary: #64748B;
+  --hd-text-muted: #94A3B8;
+  --hd-text-inverse: #FFFFFF;
+
+  /* Alerts & semantic */
+  --hd-success: #059669;
+  --hd-warning: #D97706;
+  --hd-danger: #DC2626;
+  --hd-info: #0284C7;
+
+  /* Data viz */
+  --hd-risk-low: #22C55E;
+  --hd-risk-moderate: #EAB308;
+  --hd-risk-high: #F97316;
+  --hd-risk-critical: #DC2626;
+
+  /* Typography */
+  --hd-font: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --hd-font-mono: "JetBrains Mono", "Consolas", monospace;
+  --hd-space-xs: 4px;
+  --hd-space-sm: 8px;
+  --hd-space-md: 12px;
+  --hd-space-lg: 16px;
+  --hd-space-xl: 24px;
+  --hd-space-2xl: 32px;
+  --hd-radius: 8px;
+  --hd-radius-sm: 6px;
+}
+
+/* Base page */
+body {
+  background-color: var(--hd-bg) !important;
+  color: var(--hd-text);
+  font-family: var(--hd-font);
+}
+
+/* ---- Dashboard header / navbar ---- */
+.hd-dashboard .navbar,
+.navbar.navbar-expand-md,
+.bslib-navbar,
+nav.navbar {
+  background: linear-gradient(135deg, var(--hd-primary) 0%, #1a5a9e 100%) !important;
+  border-bottom: none !important;
+  box-shadow: 0 1px 3px rgba(15, 76, 129, 0.2);
+}
+
+.hd-dashboard .navbar .navbar-brand,
+.hd-dashboard .navbar .nav-link,
+.navbar .navbar-brand,
+.navbar .nav-link,
+.bslib-navbar .navbar-brand,
+nav.navbar a {
+  color: var(--hd-text-inverse) !important;
+  font-weight: 600;
+  font-size: 1rem;
+}
+
+.hd-dashboard .navbar .nav-link:hover,
+.navbar .nav-link:hover,
+.navbar .nav-link.active,
+nav.navbar a:hover {
+  color: var(--hd-text-inverse) !important;
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: var(--hd-radius-sm);
+}
+
+/* ---- Main content area ---- */
+.hd-dashboard .container-fluid,
+.hd-dashboard main,
+.hd-dashboard .bslib-page-fill,
+div.container-fluid {
+  padding: var(--hd-space-xl) !important;
+  max-width: 1600px;
+  margin-left: auto;
+  margin-right: auto;
+  background-color: var(--hd-bg);
+}
+
+/* ---- Sidebar / filters ---- */
+.bslib-sidebar-layout .bslib-sidebar,
+.sidebar {
+  background-color: var(--hd-card-bg) !important;
+  border-right: 1px solid var(--hd-border) !important;
+  padding: var(--hd-space-lg) !important;
+}
+
+.bslib-sidebar-layout .bslib-sidebar .bslib-sidebar-title {
+  color: var(--hd-text);
+  font-weight: 600;
+  font-size: 1rem;
+}
+
+.bslib-sidebar-layout .form-label,
+.sidebar label {
+  color: var(--hd-text-secondary);
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+.bslib-sidebar-layout .form-control,
+.bslib-sidebar-layout select {
+  border-color: var(--hd-border);
+  border-radius: var(--hd-radius-sm);
+}
+
+.bslib-sidebar-layout .form-control:focus {
+  border-color: var(--hd-primary);
+  box-shadow: 0 0 0 3px rgba(15, 76, 129, 0.15);
+}
+
+/* ---- Value boxes / KPI cards ---- */
+.bslib-value-box {
+  background-color: var(--hd-card-bg) !important;
+  border: 1px solid var(--hd-border) !important;
+  border-radius: var(--hd-radius) !important;
+  padding: var(--hd-space-lg) !important;
+  min-height: 100px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+.bslib-value-box .value-box-title {
+  color: var(--hd-text-secondary) !important;
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+.bslib-value-box .value-box-value {
+  color: var(--hd-text) !important;
+  font-size: 1.75rem;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+/* Value box themes → palette */
+.bslib-value-box[data-theme="primary"] {
+  border-left: 4px solid var(--hd-primary);
+}
+
+.bslib-value-box[data-theme="info"] {
+  border-left: 4px solid var(--hd-info);
+}
+
+.bslib-value-box[data-theme="warning"] {
+  border-left: 4px solid var(--hd-warning);
+}
+
+.bslib-value-box[data-theme="danger"] {
+  border-left: 4px solid var(--hd-danger);
+}
+
+.bslib-value-box[data-theme="success"] {
+  border-left: 4px solid var(--hd-success);
+}
+
+/* ---- Cards / panels ---- */
+.bslib-card,
+.card {
+  background-color: var(--hd-card-bg) !important;
+  border: 1px solid var(--hd-border) !important;
+  border-radius: var(--hd-radius) !important;
+  padding: var(--hd-space-lg) !important;
+  margin-bottom: var(--hd-space-lg);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+.bslib-card-header,
+.card-header {
+  background: #F8FAFC !important;
+  color: var(--hd-text) !important;
+  font-weight: 600;
+  font-size: 1rem;
+  border-bottom: 1px solid var(--hd-border) !important;
+  padding: var(--hd-space-md) var(--hd-space-lg);
+  border-radius: var(--hd-radius) var(--hd-radius) 0 0;
+}
+
+/* ---- Section titles ---- */
+h5, .h5 {
+  color: var(--hd-text);
+  font-weight: 600;
+  font-size: 1.125rem;
+  margin-top: var(--hd-space-lg);
+  margin-bottom: var(--hd-space-md);
+}
+
+hr {
+  border-color: var(--hd-border);
+  margin: var(--hd-space-xl) 0;
+}
+
+/* ---- Tables ---- */
+.table,
+.bslib-table,
+.dataTables_wrapper table {
+  font-size: 0.875rem;
+  color: var(--hd-text);
+}
+
+.table thead th,
+.dataTables_wrapper thead th {
+  background-color: #F8FAFC !important;
+  color: var(--hd-text) !important;
+  font-weight: 600;
+  font-size: 0.8125rem;
+  border-bottom: 1px solid var(--hd-border);
+  padding: var(--hd-space-md) var(--hd-space-lg);
+}
+
+.table tbody td,
+.dataTables_wrapper tbody td {
+  border-bottom: 1px solid var(--hd-border-subtle);
+  padding: var(--hd-space-md) var(--hd-space-lg);
+}
+
+.table-bordered {
+  border-color: var(--hd-border);
+}
+
+.table-striped tbody tr:nth-of-type(odd) {
+  background-color: #F8FAFC;
+}
+
+/* ---- Buttons ---- */
+.btn-primary {
+  background-color: var(--hd-primary) !important;
+  border-color: var(--hd-primary) !important;
+  color: var(--hd-text-inverse) !important;
+  font-weight: 500;
+  border-radius: var(--hd-radius-sm);
+  padding: 10px 20px;
+}
+
+.btn-primary:hover {
+  background-color: var(--hd-primary-hover) !important;
+  border-color: var(--hd-primary-hover) !important;
+  color: var(--hd-text-inverse) !important;
+}
+
+.btn-secondary {
+  border-color: var(--hd-border);
+  color: var(--hd-text-secondary);
+  border-radius: var(--hd-radius-sm);
+}
+
+/* ---- Alerts ---- */
+.alert-danger {
+  background-color: #FEF2F2;
+  border-color: var(--hd-danger);
+  color: #991B1B;
+}
+
+.alert-warning {
+  background-color: #FFFBEB;
+  border-color: var(--hd-warning);
+  color: #92400E;
+}
+
+.alert-success {
+  background-color: #F0FDF4;
+  border-color: var(--hd-success);
+  color: #065F46;
+}
+
+.alert-info {
+  background-color: #F0F9FF;
+  border-color: var(--hd-info);
+  color: #0369A1;
+}
+
+/* ---- AI / summary blocks ---- */
+.bslib-card .bslib-card-body p {
+  color: var(--hd-text);
+  line-height: 1.5;
+}
+
+/* ---- Empty / placeholder states ---- */
+.text-muted {
+  color: var(--hd-text-muted) !important;
+}
+
+/* ---- Data frame container ---- */
+.bslib-data-frame,
+.dataTables_wrapper {
+  border-radius: var(--hd-radius);
+  overflow: hidden;
+}
+
+/* ---- Pagination ---- */
+.dataTables_wrapper .dataTables_paginate .paginate_button {
+  border-radius: var(--hd-radius-sm) !important;
+  border-color: var(--hd-border) !important;
+}
+
+.dataTables_wrapper .dataTables_paginate .paginate_button.current {
+  background: var(--hd-primary) !important;
+  border-color: var(--hd-primary) !important;
+  color: var(--hd-text-inverse) !important;
+}
+
+/* ---- Utility classes for risk badges (use in server-rendered UI) ---- */
+.hd-badge-low    { background: #DCFCE7; color: #166534; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }
+.hd-badge-moderate { background: #FEF9C3; color: #854D0E; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }
+.hd-badge-high   { background: #FFEDD5; color: #9A3412; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }
+.hd-badge-critical { background: #FEE2E2; color: #991B1B; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }

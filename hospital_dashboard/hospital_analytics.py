@@ -1,23 +1,38 @@
 """
-Layer 2 — Analytics Query Layer
+Layer 2 — Analytics Engine
 
-This module computes hospital metrics using data from the Supabase data access layer.
-All functions return results formatted for dashboard visualization.
+All calculations and data transformations. Uses the data repository for Supabase
+queries only. Can run independently for debugging (python -m hospital_analytics).
 
-Hospital profile (assumptions):
-- ~5000 patients, 250–300 beds, 50 ICU beds. Departments: Cardiology, Pulmonology,
-  Oncology, Orthopedics, General Medicine.
-- High readmission risk: 30-day readmission risk ≥ READMISSION_RISK_THRESHOLD (0.6).
-- ICU high operational risk: occupancy above ICU_HIGH_RISK_OCCUPANCY (90%).
+- ICU occupancy
+- Readmission risk filtering
+- No-show rate aggregation
+- Admission trends
+- Patient history
+
+Hospital profile: ~5000 patients, 50 ICU beds. High readmission ≥ 0.6; ICU risk ≥ 90%.
 """
 
 from typing import Any, Optional
 
 import pandas as pd
 
+from constants import (
+    PATIENT_ID_COL,
+    READMISSION_RISK_COL,
+    ADMISSION_DATE_COL,
+    DISCHARGE_DATE_COL,
+    DEPARTMENT_COL,
+    HIGH_RISK_EMPTY_COLS,
+    DEPT_NO_SHOW_EMPTY_COLS,
+    TREND_EMPTY_COLS,
+)
+
 # Operational thresholds (hospital assumptions)
 READMISSION_RISK_THRESHOLD = 0.6   # Patients above this are flagged in the system
 ICU_HIGH_RISK_OCCUPANCY = 0.9     # ICU occupancy ≥ 90% = high operational risk
+
+from dashboard_log import log as _log, log_error as _log_error, log_empty as _log_empty
 
 from database_connection import (
     get_patients,
@@ -30,6 +45,13 @@ from database_connection import (
 )
 
 
+def _log_df(stage: str, message: str, df: pd.DataFrame) -> None:
+    """Log DataFrame shape and column names for analytics debugging."""
+    rows = 0 if df is None or df.empty else len(df)
+    cols = list(df.columns) if df is not None and not df.empty else []
+    _log(stage, message, rows=rows, columns=cols)
+
+
 def _safe_date_col(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
     """Return first existing column name from candidates, or None."""
     for c in candidates:
@@ -38,14 +60,66 @@ def _safe_date_col(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
     return None
 
 
+def _get_data_reference_date(df: pd.DataFrame, date_col: str) -> pd.Timestamp:
+    """
+    Returns the most recent date in the given DataFrame as the reference 'today'.
+    Used when a single table is already loaded. For global ref, use get_data_reference_date().
+    """
+    if df is None or df.empty or date_col not in df.columns:
+        return pd.Timestamp.now()
+    latest = pd.to_datetime(df[date_col], errors="coerce").max()
+    if pd.isna(latest):
+        return pd.Timestamp.now()
+    return latest
+
+
+def get_data_reference_date() -> pd.Timestamp:
+    """
+    Global data reference date: the most recent timestamp in admissions or appointments.
+    Use this as the system's "today" so the dashboard works with historical datasets
+    (e.g. 2023-01-01 to 2024-08-23) instead of the real current date.
+    Falls back to pd.Timestamp.now() only if no dates exist in either table.
+    """
+    candidates = []
+    admissions = get_admissions()
+    if admissions is not None and not admissions.empty:
+        adate = _safe_date_col(admissions, ["admission_date", "admit_date", "start_date", "date"])
+        if adate:
+            ser = pd.to_datetime(admissions[adate], errors="coerce")
+            latest = ser.max()
+            if pd.notna(latest):
+                candidates.append(latest)
+    appointments = get_appointments()
+    if appointments is not None and not appointments.empty:
+        adate = _safe_date_col(appointments, ["appointment_date", "scheduled_date", "date", "appointment_at"])
+        if adate:
+            ser = pd.to_datetime(appointments[adate], errors="coerce")
+            latest = ser.max()
+            if pd.notna(latest):
+                candidates.append(latest)
+    if not candidates:
+        _log("Analytics", "get_data_reference_date: no dates in admissions/appointments, using now()")
+        return pd.Timestamp.now()
+    ref = max(candidates)
+    _log("Analytics", "get_data_reference_date", ref=str(ref))
+    return ref
+
+
 def get_total_patients() -> int:
     """
     Return total number of distinct patients in the system.
     """
     patients = get_patients()
+    _log_df("Analytics", "get_total_patients (patients table)", patients)
+    if patients is None or patients.empty:
+        _log_empty("Analytics", "get_total_patients (no patients)", 0)
+        return 0
     if "patient_id" in patients.columns:
-        return int(patients["patient_id"].nunique())
-    return len(patients)
+        n = int(patients["patient_id"].nunique())
+    else:
+        n = len(patients)
+    _log("Analytics", "get_total_patients result", total_patients=n)
+    return n
 
 
 def get_icu_occupancy() -> dict[str, Any]:
@@ -54,7 +128,9 @@ def get_icu_occupancy() -> dict[str, Any]:
     Assumes icu_beds has columns like bed_id, occupied (or status), and optionally unit.
     """
     beds = get_icu_beds()
-    if beds.empty:
+    _log_df("Analytics", "compute_icu_occupancy (icu_beds)", beds)
+    if beds is None or beds.empty:
+        _log("Analytics", "compute_icu_occupancy result", total=0, occupied=0, rate=0.0, high_operational_risk=False)
         return {"total": 0, "occupied": 0, "rate": 0.0, "high_operational_risk": False}
 
     occupied_col = "occupied" if "occupied" in beds.columns else None
@@ -73,68 +149,221 @@ def get_icu_occupancy() -> dict[str, Any]:
         occupied = int(beds[pid_col].notna().sum()) if pid_col else 0
 
     rate = (occupied / total) if total else 0.0
-    return {
+    result = {
         "total": total,
         "occupied": occupied,
         "rate": round(rate, 4),
         "high_operational_risk": rate >= ICU_HIGH_RISK_OCCUPANCY,  # ≥90% per hospital assumption
     }
+    _log("Analytics", "compute_icu_occupancy result", **result)
+    return result
+
+
+def compute_icu_occupancy() -> dict[str, Any]:
+    """Public API: ICU occupancy metrics. Same as get_icu_occupancy()."""
+    return get_icu_occupancy()
+
+
+def get_system_strain() -> dict[str, Any]:
+    """
+    Single call that returns all Command Center strain metrics. Use this instead of
+    6 separate calls so KPIs and AI use identical data.
+    Returns: icu_rate (0-1), readmit_rate (0-1), noshow_rate (0-1), strain_score (0-100),
+    strain_level ('normal'|'elevated'|'critical'), discharge_pending (int),
+    admissions_today (int), discharges_today (int), total_patients (int), icu_total (int),
+    icu_occupied (int), high_readmission_count (int), likely_no_show_count (int).
+    """
+    icu = get_icu_occupancy()
+    total_patients = get_total_patients()
+    high_readmission = get_high_readmission_patients(limit=500)
+    no_shows = get_likely_no_shows(days_ahead=1)
+    admissions = get_admissions()
+    if admissions is None:
+        admissions = pd.DataFrame()
+
+    icu_total = icu.get("total") or 0
+    icu_occupied = icu.get("occupied") or 0
+    icu_rate = (icu.get("rate") or 0.0)
+    high_readmission_count = len(high_readmission)  # get_high_readmission_patients already returns distinct patients
+    likely_no_show_count = len(no_shows)
+    readmit_rate = (high_readmission_count / total_patients) if total_patients else 0.0
+    noshow_rate = min(1.0, (likely_no_show_count / max(total_patients * 0.1, 1))) if total_patients else 0.0
+
+    strain_score = (icu_rate * 0.4 + readmit_rate * 0.35 + noshow_rate * 0.25) * 100
+    strain_score = min(100.0, max(0.0, strain_score))
+    if strain_score < 40:
+        strain_level = "normal"
+    elif strain_score <= 70:
+        strain_level = "elevated"
+    else:
+        strain_level = "critical"
+
+    adate = _safe_date_col(admissions, [ADMISSION_DATE_COL, "admit_date", "start_date", "date"])
+    ddate = _safe_date_col(admissions, [DISCHARGE_DATE_COL, "discharge_at", "end_date"])
+    expdate = _safe_date_col(admissions, ["expected_discharge_date", "expected_discharge", "planned_discharge"])
+    ref = get_data_reference_date()
+    ref_date = ref.date() if hasattr(ref, "date") else ref
+    discharge_pending = 0
+    admissions_today = 0
+    discharges_today = 0
+    if admissions is not None and not admissions.empty and adate:
+        adm = admissions.copy()
+        adm[adate] = pd.to_datetime(adm[adate], errors="coerce")
+        admissions_today = int((adm[adate].dt.date == ref_date).sum())
+        if ddate and ddate in adm.columns:
+            adm[ddate] = pd.to_datetime(adm[ddate], errors="coerce")
+            discharges_today = int((adm[ddate].dt.date == ref_date).sum())
+        if expdate and expdate in adm.columns and ddate and ddate in adm.columns:
+            adm[expdate] = pd.to_datetime(adm[expdate], errors="coerce")
+            still_present = adm[ddate].isna() | (adm[ddate].dt.date > ref_date)
+            discharge_pending = int((still_present & adm[expdate].notna() & (adm[expdate].dt.date < ref_date)).sum())
+
+    trend = get_admissions_trend(days=7)
+    dept_no_show = get_department_no_show_rates()
+    admissions_trend_records = trend.to_dict(orient="records") if not trend.empty else []
+    department_no_show_records = dept_no_show.head(10).to_dict(orient="records") if not dept_no_show.empty else []
+
+    return {
+        "icu_rate": round(icu_rate, 4),
+        "readmit_rate": round(readmit_rate, 4),
+        "noshow_rate": round(noshow_rate, 4),
+        "strain_score": round(strain_score, 1),
+        "strain_level": strain_level,
+        "discharge_pending": discharge_pending,
+        "admissions_today": admissions_today,
+        "discharges_today": discharges_today,
+        "total_patients": total_patients,
+        "icu_total": icu_total,
+        "icu_occupied": icu_occupied,
+        "high_readmission_count": high_readmission_count,
+        "likely_no_show_count": likely_no_show_count,
+        "admissions_trend_records": admissions_trend_records,
+        "department_no_show_records": department_no_show_records,
+        "data_as_of": ref_date.strftime("%b %d, %Y"),
+    }
+
+
+# Display columns for high-risk table (dashboard)
+_HIGH_RISK_DISPLAY_COLS = [PATIENT_ID_COL, READMISSION_RISK_COL, "admission_count"]
+
+
+def _empty_high_risk_df() -> pd.DataFrame:
+    """Return empty DataFrame with correct columns for high-risk contract."""
+    return pd.DataFrame(columns=HIGH_RISK_EMPTY_COLS)
+
+
+def get_high_risk_patients(limit: int = 20) -> pd.DataFrame:
+    """
+    Return patients flagged with high 30-day readmission risk (≥ READMISSION_RISK_THRESHOLD),
+    sorted by risk, top N. Uses risk_scores when available, else derives from admissions.
+    Returns DataFrame with display-friendly columns when possible.
+    """
+    return get_high_readmission_patients(limit=limit)
 
 
 def get_high_readmission_patients(limit: int = 20) -> pd.DataFrame:
     """
     Return patients flagged with high 30-day readmission risk (≥ READMISSION_RISK_THRESHOLD),
     sorted by risk, top N. Uses risk_scores when available, else derives from admissions.
+    Database column: readmission_risk (numeric). Raises on fetch/processing errors.
     """
-    risk_df = get_risk_scores()
-    patients = get_patients()
-    admissions = get_admissions()
+    _rs = get_risk_scores()
+    risk_df = _rs if _rs is not None else pd.DataFrame()
+    _pt = get_patients()
+    patients = _pt if _pt is not None else pd.DataFrame()
+    _adm = get_admissions()
+    admissions = _adm if _adm is not None else pd.DataFrame()
 
-    # Schema with readmission_risk column (our Supabase schema)
-    if not risk_df.empty and "readmission_risk" in risk_df.columns and "patient_id" in risk_df.columns:
-        out = risk_df[risk_df["readmission_risk"] >= READMISSION_RISK_THRESHOLD].copy()
-        out = out.sort_values("readmission_risk", ascending=False).head(limit)
-        if not patients.empty and "patient_id" in patients.columns:
-            out = out.merge(patients, on="patient_id", how="left")
+    _log_df("Analytics", "get_high_risk_patients (risk_scores)", risk_df)
+    _log("Analytics", "get_high_risk_patients inputs", risk_rows=len(risk_df), risk_columns=list(risk_df.columns))
+
+    def _coerce_risk(series):
+        return pd.to_numeric(series, errors="coerce").fillna(0)
+
+    # Schema with readmission_risk column (matches Supabase risk_scores.readmission_risk)
+    if not risk_df.empty and READMISSION_RISK_COL in risk_df.columns and PATIENT_ID_COL in risk_df.columns:
+        risk_df = risk_df.copy()
+        risk_df[READMISSION_RISK_COL] = _coerce_risk(risk_df[READMISSION_RISK_COL])
+        # Normalize to 0.0-1.0 if stored as 0-100
+        if risk_df[READMISSION_RISK_COL].max() > 1.0:
+            risk_df[READMISSION_RISK_COL] = risk_df[READMISSION_RISK_COL] / 100.0
+        out = risk_df[risk_df[READMISSION_RISK_COL] >= READMISSION_RISK_THRESHOLD].copy()
+        out = out.drop_duplicates(subset=[PATIENT_ID_COL], keep="first")
+        _log("HighRisk", f"filter readmission_risk>={READMISSION_RISK_THRESHOLD}", after_filter=len(out))
+        if out.empty:
+            _log_empty("HighRisk", "High readmission query", 0)
+            return _empty_high_risk_df()
+        out = out.sort_values(READMISSION_RISK_COL, ascending=False).head(limit)
+        if not patients.empty and PATIENT_ID_COL in patients.columns:
+            out = out.merge(patients, on=PATIENT_ID_COL, how="left", suffixes=("", "_y"))
+            out = out[[c for c in out.columns if not c.endswith("_y")]]
+        # Trim to display columns if we have many
+        prefer = [c for c in _HIGH_RISK_DISPLAY_COLS if c in out.columns]
+        if prefer and len(out.columns) > len(prefer):
+            out = out[prefer]
+        _log_df("Analytics", "get_high_risk_patients result", out)
         return out
 
     # Alternative schema: score_type + value
-    if not risk_df.empty and "score_type" in risk_df.columns and "patient_id" in risk_df.columns:
+    if not risk_df.empty and "score_type" in risk_df.columns and PATIENT_ID_COL in risk_df.columns:
         readmission = risk_df[risk_df["score_type"].astype(str).str.lower().str.contains("readmission", na=False)]
-        if not readmission.empty:
+        if not readmission.empty and PATIENT_ID_COL in readmission.columns:
             value_col = "value" if "value" in readmission.columns else "score"
             if value_col not in readmission.columns:
-                value_col = readmission.select_dtypes(include="number").columns[0] if len(readmission.select_dtypes(include="number").columns) else None
+                num_cols = readmission.select_dtypes(include="number").columns
+                value_col = num_cols[0] if len(num_cols) > 0 else None
             if value_col:
-                out = readmission.groupby("patient_id")[value_col].max().reset_index()
-                out = out.rename(columns={value_col: "readmission_risk"})
-                out = out[out["readmission_risk"] >= READMISSION_RISK_THRESHOLD]
-                out = out.sort_values("readmission_risk", ascending=False).head(limit)
-                if not patients.empty and "patient_id" in patients.columns:
-                    out = out.merge(patients, on="patient_id", how="left")
+                out = readmission.groupby(PATIENT_ID_COL)[value_col].max().reset_index()
+                out = out.rename(columns={value_col: READMISSION_RISK_COL})
+                out[READMISSION_RISK_COL] = _coerce_risk(out[READMISSION_RISK_COL])
+                if out[READMISSION_RISK_COL].max() > 1.0:
+                    out[READMISSION_RISK_COL] = out[READMISSION_RISK_COL] / 100.0
+                out = out[out[READMISSION_RISK_COL] >= READMISSION_RISK_THRESHOLD]
+                if out.empty:
+                    _log_empty("HighRisk", "alternative schema filter", 0)
+                    return _empty_high_risk_df()
+                out = out.sort_values(READMISSION_RISK_COL, ascending=False).head(limit)
+                if not patients.empty and PATIENT_ID_COL in patients.columns:
+                    out = out.merge(patients, on=PATIENT_ID_COL, how="left", suffixes=("", "_y"))
+                    out = out[[c for c in out.columns if not c.endswith("_y")]]
+                prefer = [c for c in _HIGH_RISK_DISPLAY_COLS if c in out.columns]
+                if prefer and len(out.columns) > len(prefer):
+                    out = out[prefer]
+                _log_df("Analytics", "get_high_risk_patients result (alt schema)", out)
                 return out
 
-    # Fallback: use admission count as proxy; normalize to 0–1 and filter by threshold
-    if not admissions.empty and "patient_id" in admissions.columns:
-        counts = admissions.groupby("patient_id").size().reset_index(name="admission_count")
+    # Fallback: use admission count as proxy
+    if not admissions.empty and PATIENT_ID_COL in admissions.columns:
+        counts = admissions.groupby(PATIENT_ID_COL).size().reset_index(name="admission_count")
         max_count = counts["admission_count"].max()
-        counts["readmission_risk"] = (counts["admission_count"] / max_count).clip(0, 1) if max_count else 0
-        counts = counts[counts["readmission_risk"] >= READMISSION_RISK_THRESHOLD]
-        counts = counts.sort_values("readmission_risk", ascending=False).head(limit)
-        if not patients.empty and "patient_id" in patients.columns:
-            counts = counts.merge(patients, on="patient_id", how="left")
+        counts[READMISSION_RISK_COL] = (counts["admission_count"] / max_count).clip(0, 1) if max_count else 0
+        counts = counts[counts[READMISSION_RISK_COL] >= READMISSION_RISK_THRESHOLD]
+        if counts.empty:
+            _log_empty("HighRisk", "fallback admission proxy", 0)
+            return _empty_high_risk_df()
+        counts = counts.sort_values(READMISSION_RISK_COL, ascending=False).head(limit)
+        if not patients.empty and PATIENT_ID_COL in patients.columns:
+            counts = counts.merge(patients, on=PATIENT_ID_COL, how="left", suffixes=("", "_y"))
+            counts = counts[[c for c in counts.columns if not c.endswith("_y")]]
+        prefer = [c for c in _HIGH_RISK_DISPLAY_COLS if c in counts.columns]
+        if prefer and len(counts.columns) > len(prefer):
+            counts = counts[prefer + [c for c in counts.columns if c not in prefer]][prefer]
+        _log_df("Analytics", "get_high_risk_patients result (fallback)", counts)
         return counts
 
-    return pd.DataFrame()
+    _log_empty("HighRisk", "no matching schema", 0)
+    return _empty_high_risk_df()
 
 
 def get_likely_no_shows(days_ahead: int = 1) -> pd.DataFrame:
     """
     Return appointments in the next N days that are likely no-shows.
     Uses risk_scores when available (no_show risk), otherwise returns upcoming appointments.
+    If no upcoming appointments match, returns historical no-shows from last 30 days as fallback.
     """
     appointments = get_appointments()
-    if appointments.empty:
+    _log_df("Analytics", "get_likely_no_shows (appointments)", appointments)
+    if appointments is None or appointments.empty:
         return pd.DataFrame()
 
     date_col = _safe_date_col(appointments, ["appointment_date", "scheduled_date", "date", "appointment_at"])
@@ -142,85 +371,170 @@ def get_likely_no_shows(days_ahead: int = 1) -> pd.DataFrame:
         return pd.DataFrame()
 
     appointments = appointments.copy()
-    appointments[date_col] = pd.to_datetime(appointments[date_col], errors="coerce")
-    appointments = appointments.dropna(subset=[date_col])
+    appointments["_dt"] = pd.to_datetime(appointments[date_col], errors="coerce")
+    appointments = appointments.dropna(subset=["_dt"])
+    appointments["appt_date_only"] = appointments["_dt"].dt.date
 
-    today = pd.Timestamp.now().normalize()
-    end = today + pd.Timedelta(days=days_ahead)
-    upcoming = appointments[(appointments[date_col].dt.date >= today.date()) & (appointments[date_col].dt.date <= end.date())]
+    ref = get_data_reference_date()
+    today = ref.date() if hasattr(ref, "date") else ref
+    target = (ref + pd.Timedelta(days=days_ahead)).date() if hasattr(ref, "date") else ref
+    mask_tomorrow = appointments["appt_date_only"] == target
+    n_matches = int(mask_tomorrow.sum())
+    _log("Analytics", "get_likely_no_shows", data_ref_date=str(today), target_date=str(target), target_matches=n_matches)
 
-    risk_df = get_risk_scores()
-    # Schema with no_show_risk column (our Supabase schema)
-    if not risk_df.empty and "no_show_risk" in risk_df.columns and "patient_id" in risk_df.columns:
-        no_show_risk = risk_df[["patient_id", "no_show_risk"]].copy()
-        upcoming = upcoming.merge(no_show_risk, on="patient_id", how="left")
-        upcoming["no_show_risk"] = upcoming["no_show_risk"].fillna(0)
-        upcoming = upcoming.sort_values("no_show_risk", ascending=False)
-        return upcoming
-    # Alternative schema: score_type + value
-    if not risk_df.empty and "score_type" in risk_df.columns:
-        no_show = risk_df[risk_df["score_type"].astype(str).str.lower().str.contains("no_show|noshow", na=False, regex=True)]
-        if not no_show.empty and "patient_id" in no_show.columns:
-            value_col = "value" if "value" in no_show.columns else "score"
-            if value_col not in no_show.columns and no_show.select_dtypes(include="number").columns.any():
-                value_col = no_show.select_dtypes(include="number").columns[0]
-            if value_col:
-                no_show_risk = no_show.groupby("patient_id")[value_col].max().reset_index()
-                no_show_risk = no_show_risk.rename(columns={value_col: "no_show_risk"})
-                upcoming = upcoming.merge(no_show_risk, on="patient_id", how="left")
-                upcoming["no_show_risk"] = upcoming["no_show_risk"].fillna(0)
-                upcoming = upcoming.sort_values("no_show_risk", ascending=False)
+    # Primary: target day's appointments
+    if n_matches > 0:
+        upcoming = appointments.loc[mask_tomorrow].copy()
+        upcoming = upcoming.drop(columns=["_dt", "appt_date_only"], errors="ignore")
+        risk_df = get_risk_scores()
+        # Schema with no_show_risk column (our Supabase schema)
+        if not risk_df.empty and "no_show_risk" in risk_df.columns and "patient_id" in risk_df.columns:
+            no_show_risk = risk_df[["patient_id", "no_show_risk"]].copy()
+            upcoming = upcoming.merge(no_show_risk, on="patient_id", how="left")
+            upcoming["no_show_risk"] = upcoming["no_show_risk"].fillna(0)
+            upcoming = upcoming.sort_values("no_show_risk", ascending=False)
+            _log_df("Analytics", "get_likely_no_shows result", upcoming)
             return upcoming
+        # Alternative schema: score_type + value
+        if not risk_df.empty and "score_type" in risk_df.columns:
+            no_show = risk_df[risk_df["score_type"].astype(str).str.lower().str.contains("no_show|noshow", na=False, regex=True)]
+            if not no_show.empty and "patient_id" in no_show.columns:
+                value_col = "value" if "value" in no_show.columns else "score"
+                if value_col not in no_show.columns and no_show.select_dtypes(include="number").columns.any():
+                    value_col = no_show.select_dtypes(include="number").columns[0]
+                if value_col:
+                    no_show_risk = no_show.groupby("patient_id")[value_col].max().reset_index()
+                    no_show_risk = no_show_risk.rename(columns={value_col: "no_show_risk"})
+                    upcoming = upcoming.merge(no_show_risk, on="patient_id", how="left")
+                    upcoming["no_show_risk"] = upcoming["no_show_risk"].fillna(0)
+                    upcoming = upcoming.sort_values("no_show_risk", ascending=False)
+                _log_df("Analytics", "get_likely_no_shows result (alt schema)", upcoming)
+                return upcoming
+        _log_df("Analytics", "get_likely_no_shows result (upcoming only)", upcoming)
+        return upcoming
 
-    return upcoming
+    # Fallback 1: most recent 10 "upcoming" (on or after today)
+    mask_upcoming = appointments["appt_date_only"] >= today
+    if mask_upcoming.sum() > 0:
+        upcoming = appointments.loc[mask_upcoming].sort_values("_dt").head(10).copy()
+        upcoming = upcoming.drop(columns=["_dt", "appt_date_only"], errors="ignore")
+        risk_df = get_risk_scores()
+        if risk_df is not None and not risk_df.empty and "no_show_risk" in risk_df.columns and "patient_id" in risk_df.columns:
+            no_show_risk = risk_df[["patient_id", "no_show_risk"]].copy()
+            upcoming = upcoming.merge(no_show_risk, on="patient_id", how="left")
+            upcoming["no_show_risk"] = upcoming["no_show_risk"].fillna(0)
+            upcoming = upcoming.sort_values("no_show_risk", ascending=False)
+        _log_empty("NoShow", "target date had 0 rows; using 10 upcoming appointments", len(upcoming))
+        _log_df("Analytics", "get_likely_no_shows result (10 upcoming)", upcoming)
+        return upcoming
 
+    # Fallback 2: historical no-shows in last 30 days
+    thirty_days_ago = (ref - pd.Timedelta(days=30)).date() if hasattr(ref, "date") else ref
+    no_show_col = "no_show" if "no_show" in appointments.columns else None
+    if no_show_col:
+        mask_fallback = (
+            (appointments[no_show_col].fillna(False).astype(bool))
+            & (appointments["appt_date_only"] >= thirty_days_ago)
+        )
+        result = appointments.loc[mask_fallback].copy()
+        if not result.empty:
+            result["note"] = "historical no-show (last 30 days)"
+            result = result.drop(columns=["_dt", "appt_date_only"], errors="ignore")
+            _log_empty("NoShow", "target date had 0 rows; using historical no-shows (last 30d)", len(result))
+            _log_df("Analytics", "get_likely_no_shows result (fallback 30d)", result)
+            return result
+
+    # Fallback 3: last 10 appointments in dataset (always return data when appointments exist)
+    last_10 = appointments.sort_values("_dt", ascending=False).head(10).copy()
+    last_10 = last_10.drop(columns=["_dt", "appt_date_only"], errors="ignore")
+    _log_empty("NoShow", "target date had 0 rows; using last 10 appointments in dataset", len(last_10))
+    _log_df("Analytics", "get_likely_no_shows result (last 10)", last_10)
+    return last_10
+
+
+MIN_TREND_DAYS = 7  # minimum rows for plotting; expand window if fewer
 
 def get_admissions_trend(days: int = 30) -> pd.DataFrame:
     """
     Return daily admission and discharge counts for the last N days.
-    DataFrame columns: date, admissions, discharges (or similar).
+    Uses global data reference date so historical datasets work.
+    If the filtered window has too few rows, expands the window automatically.
+    Always returns a DataFrame with columns date, admissions, discharges (never None).
     """
     admissions = get_admissions()
-    if admissions.empty:
-        return pd.DataFrame()
+    _log_df("Analytics", "get_admissions_trend (admissions)", admissions)
+    if admissions is None or admissions.empty:
+        return pd.DataFrame(columns=TREND_EMPTY_COLS)
 
     adate = _safe_date_col(admissions, ["admission_date", "admit_date", "start_date", "date"])
     ddate = _safe_date_col(admissions, ["discharge_date", "discharge_at", "end_date"])
     if not adate:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=TREND_EMPTY_COLS)
 
-    admissions = admissions.copy()
-    admissions[adate] = pd.to_datetime(admissions[adate], errors="coerce")
-    admissions = admissions.dropna(subset=[adate])
-    if ddate:
-        admissions[ddate] = pd.to_datetime(admissions[ddate], errors="coerce")
+    df = admissions.copy()
+    df[adate] = pd.to_datetime(df[adate], errors="coerce", format="mixed")
+    df = df.dropna(subset=[adate])
+    if df.empty:
+        return pd.DataFrame(columns=TREND_EMPTY_COLS)
 
-    cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=days)
-    admissions = admissions[admissions[adate] >= cutoff]
+    ref_ts = get_data_reference_date()
+    if not isinstance(ref_ts, pd.Timestamp):
+        ref_ts = pd.Timestamp(ref_ts)
+    cutoff = ref_ts - pd.Timedelta(days=days)
+    mask = df[adate] >= cutoff
+    filtered = df.loc[mask].copy()
 
-    admissions["_date"] = admissions[adate].dt.date
-    daily_adm = admissions.groupby("_date").size().reset_index(name="admissions")
+    # Defensive: ensure enough data for plotting (expand window if too few rows)
+    min_rows = MIN_TREND_DAYS
+    if len(filtered) == 0:
+        _log_empty("Trend", "date window returned 0 rows; using last N rows by date", min_rows)
+        filtered = df.sort_values(adate).tail(max(days, min_rows)).copy()
+    else:
+        n_dates = filtered[adate].dt.date.nunique()
+        if n_dates < MIN_TREND_DAYS:
+            expanded_days = min(days * 2, 365)
+            cutoff2 = ref_ts - pd.Timedelta(days=expanded_days)
+            filtered = df.loc[df[adate] >= cutoff2].copy()
+            _log("Analytics", "get_admissions_trend expanded window", reason=f"<{MIN_TREND_DAYS} days", expanded_days=expanded_days, rows=len(filtered))
 
-    if ddate:
-        admissions["_ddate"] = admissions[ddate].dt.date
-        daily_dis = admissions.dropna(subset=[ddate]).groupby("_ddate").size().reset_index(name="discharges")
-        daily_adm = daily_adm.merge(daily_dis, left_on="_date", right_on="_ddate", how="left")
-        daily_adm["discharges"] = daily_adm["discharges"].fillna(0).astype(int)
-        daily_adm = daily_adm.drop(columns=["_ddate"], errors="ignore")
+    _log("Analytics", "get_admissions_trend", ref_date=str(ref_ts), cutoff=str(cutoff), filtered_rows=len(filtered))
+    filtered["date"] = filtered[adate].dt.date
+    id_col = "admission_id" if "admission_id" in filtered.columns else filtered.columns[0]
+    trend = filtered.groupby("date").agg(admissions=(id_col, "count")).reset_index()
 
-    daily_adm = daily_adm.rename(columns={"_date": "date"})
-    daily_adm["date"] = pd.to_datetime(daily_adm["date"])
-    return daily_adm.sort_values("date")
+    if ddate and ddate in df.columns:
+        df[ddate] = pd.to_datetime(df[ddate], errors="coerce", format="mixed")
+        df["ddate"] = df[ddate].dt.date
+        discharges = df.dropna(subset=[ddate]).groupby("ddate").agg(discharges=(id_col, "count")).reset_index()
+        discharges = discharges.rename(columns={"ddate": "date"})
+        trend = trend.merge(discharges, on="date", how="left")
+        trend["discharges"] = trend["discharges"].fillna(0).astype(int)
+    else:
+        trend["discharges"] = 0
+
+    trend["date"] = pd.to_datetime(trend["date"])
+    out = trend.sort_values("date")
+    _log_df("Analytics", "get_admissions_trend result", out)
+    return out
+
+
+def get_no_show_rates() -> pd.DataFrame:
+    """Public API: no-show rate by department. Same as get_department_no_show_rates()."""
+    return get_department_no_show_rates()
 
 
 def get_department_no_show_rates() -> pd.DataFrame:
     """
-    Return no-show rate by department (or similar grouping).
-    Assumes appointments have department (or department_id) and status (no-show, completed, etc.).
+    Return no-show rate by department. Expects appointments table with:
+    - department (or column containing 'department'/'dept')
+    - no_show (bool) or status/outcome column indicating no-show.
+    Raises on fetch errors.
     """
     appointments = get_appointments()
-    if appointments.empty:
-        return pd.DataFrame()
+    _log_df("Analytics", "get_no_show_rates (appointments)", appointments)
+    if appointments is None or appointments.empty:
+        _log_empty("NoShow", "appointments table", 0)
+        return pd.DataFrame(columns=DEPT_NO_SHOW_EMPTY_COLS)
 
     dept_col = next((c for c in appointments.columns if "department" in c.lower() or "dept" in c.lower()), None)
     status_col = next((c for c in appointments.columns if "status" in c.lower() or "outcome" in c.lower()), None)
@@ -235,13 +549,41 @@ def get_department_no_show_rates() -> pd.DataFrame:
     if no_show_col:
         appointments["_no_show"] = appointments[no_show_col].fillna(False).astype(bool)
     elif status_col:
-        appointments["_no_show"] = appointments[status_col].astype(str).str.lower().str.contains("no.show|noshow|cancel|no-show", na=False, regex=True)
+        appointments["_no_show"] = appointments[status_col].astype(str).str.lower().str.contains(
+            "no-show|noshow|cancel|no_show", na=False, regex=True
+        )
     else:
-        return appointments.groupby(dept_col).size().reset_index(name="total_appointments")
+        agg = appointments.groupby(dept_col).size().reset_index(name="total_appointments")
+        agg["no_shows"] = 0
+        agg["no_show_rate"] = 0.0
+        out = agg.rename(columns={dept_col: "department"}) if dept_col != "department" else agg
+        _log_df("Analytics", "get_no_show_rates result (counts only)", out)
+        return out
+
     agg = appointments.groupby(dept_col).agg(total=("_no_show", "count"), no_shows=("_no_show", "sum")).reset_index()
-    agg["no_show_rate"] = (agg["no_shows"] / agg["total"]).round(4)
+    agg["no_show_rate"] = (agg["no_shows"] / agg["total"].replace(0, 1)).round(4)
     agg = agg.sort_values("no_show_rate", ascending=False)
-    return agg.rename(columns={"total": "total_appointments", "no_shows": "no_shows"})
+    out = agg.rename(columns={"total": "total_appointments", "no_shows": "no_shows"})
+    if dept_col != "department":
+        out = out.rename(columns={dept_col: "department"})
+    _log_df("Analytics", "get_no_show_rates result", out)
+    return out
+
+
+def get_patient_id_list(max_ids: int = 500) -> list[str]:
+    """
+    Return sorted list of patient IDs for selectors (e.g. dashboard dropdown).
+    Uses data repository only; no other processing.
+    """
+    patients = get_patients()
+    _log_df("Analytics", "get_patient_id_list (patients)", patients)
+    if patients is None or patients.empty or "patient_id" not in patients.columns:
+        _log("Analytics", "get_patient_id_list result", count=0, ids=[])
+        return []
+    ids = patients["patient_id"].astype(str).unique().tolist()
+    out = sorted(ids)[:max_ids]
+    _log("Analytics", "get_patient_id_list result", count=len(out), sample=out[:5] if out else [])
+    return out
 
 
 def get_patient_history(patient_id: str | int) -> dict[str, Any]:
@@ -250,9 +592,15 @@ def get_patient_history(patient_id: str | int) -> dict[str, Any]:
     Formatted for the Patient Digital Twin Viewer.
     Uses filtered vitals fetch (avoids loading 120k+ rows).
     """
-    patients = get_patients()
-    admissions = get_admissions()
-    risk_scores = get_risk_scores()
+    _pt = get_patients()
+    patients = _pt if _pt is not None else pd.DataFrame()
+    _adm = get_admissions()
+    admissions = _adm if _adm is not None else pd.DataFrame()
+    _rs = get_risk_scores()
+    risk_scores = _rs if _rs is not None else pd.DataFrame()
+    _log_df("Analytics", "get_patient_history (patients)", patients)
+    _log_df("Analytics", "get_patient_history (admissions)", admissions)
+    _log_df("Analytics", "get_patient_history (risk_scores)", risk_scores)
 
     pid = str(patient_id) if patient_id is not None else None
     if not pid:
@@ -285,9 +633,45 @@ def get_patient_history(patient_id: str | int) -> dict[str, Any]:
 
     risk = risk_scores[risk_scores["patient_id"] == pid] if not risk_scores.empty else pd.DataFrame()
 
+    _log(
+        "Analytics",
+        "get_patient_history result",
+        patient_id=pid,
+        demographics_keys=len(demographics),
+        vitals_rows=len(vit),
+        admissions_rows=len(adm),
+        risk_scores_rows=len(risk),
+    )
     return {
         "demographics": demographics,
         "vitals": vit,
         "admissions": adm,
         "risk_scores": risk,
     }
+
+
+# ---- Standalone run for debugging (python -m hospital_analytics or python hospital_analytics.py) ----
+if __name__ == "__main__":
+    import os
+    os.environ.setdefault("DEBUG", "1")
+    from dotenv import load_dotenv
+    from pathlib import Path
+    for p in [Path.cwd() / ".env", Path(__file__).resolve().parent / ".env"]:
+        if p.exists():
+            load_dotenv(p)
+            break
+
+    print("--- Analytics engine standalone run (DEBUG=1) ---")
+    print("compute_icu_occupancy():", compute_icu_occupancy())
+    print("get_total_patients():", get_total_patients())
+    print("get_high_risk_patients(limit=5) shape:", get_high_risk_patients(limit=5).shape)
+    print("get_no_show_rates() shape:", get_no_show_rates().shape)
+    print("get_likely_no_shows(days_ahead=1) shape:", get_likely_no_shows(days_ahead=1).shape)
+    trend = get_admissions_trend(days=7)
+    print("get_admissions_trend(days=7) shape:", trend.shape)
+    ids = get_patient_id_list(max_ids=10)
+    print("get_patient_id_list(max_ids=10) length:", len(ids), "sample:", ids[:3])
+    if ids:
+        hist = get_patient_history(ids[0])
+        print("get_patient_history(sample_id) keys:", list(hist.keys()), "demographics:", bool(hist["demographics"]))
+    print("--- Done ---")

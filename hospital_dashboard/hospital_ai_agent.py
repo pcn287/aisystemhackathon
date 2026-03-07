@@ -2,67 +2,136 @@
 Layer 4 — LLM Insight Engine
 
 This module integrates with an LLM via an OpenAI-compatible API to provide
-decision support. The AI does NOT generate raw predictions; it INTERPRETS
-risk scores, SUMMARIZES trends, and SUGGESTS operational actions based only
-on supplied structured data from the analytics layer (no fabricated numbers).
+decision support. All functions accept data_context (from get_system_strain)
+so KPIs and AI use identical numbers. No raw predictions; interprets supplied data.
 """
 
 import json
 import os
+import time
 from typing import Any, Optional
 
 from hospital_analytics import (
-    get_total_patients,
-    get_icu_occupancy,
-    get_high_readmission_patients,
-    get_likely_no_shows,
     get_admissions_trend,
     get_department_no_show_rates,
+    get_high_readmission_patients,
     get_patient_history,
 )
 
+_OPENAI_DEFAULT_BASE = "https://api.openai.com/v1"
+_LLM_TIMEOUT_SEC = 10
+_CACHE_TTL_SEC = 60
+_response_cache: dict[str, tuple[float, str]] = {}
+
+_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("LLM_API_KEY")
+if not _key or not str(_key).strip().startswith("sk-"):
+    print("[AI Agent] WARNING: OPENAI_API_KEY missing or invalid")
+    print("[AI Agent] AI features will return placeholder text")
+    _AI_AVAILABLE = False
+else:
+    _AI_AVAILABLE = True
+
+if not (os.environ.get("OPENAI_BASE_URL") or "").strip().startswith("http"):
+    os.environ.pop("OPENAI_BASE_URL", None)
+
 
 def _get_client():
-    """Lazy import and create OpenAI-compatible client from env."""
     try:
         from openai import OpenAI
     except ImportError:
         return None
     api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("LLM_API_KEY")
-    base_url = os.environ.get("OPENAI_BASE_URL")  # Optional: for non-OpenAI endpoints
     if not api_key:
         return None
-    return OpenAI(api_key=api_key, base_url=base_url if base_url else None)
+    raw = os.environ.get("OPENAI_BASE_URL") or ""
+    base_url = raw.strip() if isinstance(raw, str) else ""
+    if not base_url or not (base_url.startswith("http://") or base_url.startswith("https://")):
+        base_url = _OPENAI_DEFAULT_BASE
+        if "OPENAI_BASE_URL" in os.environ:
+            del os.environ["OPENAI_BASE_URL"]
+    return OpenAI(api_key=api_key, base_url=base_url, timeout=_LLM_TIMEOUT_SEC)
+
+
+def _as_list(val: Any) -> list[Any]:
+    """Normalize None/DataFrame/list-like values to a JSON-serializable list."""
+    if val is None:
+        return []
+    if hasattr(val, "empty") and hasattr(val, "to_dict"):
+        try:
+            return [] if val.empty else val.to_dict(orient="records")
+        except Exception:
+            return []
+    if isinstance(val, list):
+        return val
+    if isinstance(val, tuple):
+        return list(val)
+    return []
+
+
+def _safe_len(val: Any) -> int:
+    if val is None:
+        return 0
+    if hasattr(val, "empty") and hasattr(val, "__len__"):
+        try:
+            return 0 if val.empty else len(val)
+        except Exception:
+            return 0
+    try:
+        return len(val)
+    except Exception:
+        return 0
 
 
 def _call_llm(system_prompt: str, user_content: str, max_tokens: int = 1024) -> str:
-    """
-    Call LLM with system and user messages. Returns model response text or fallback.
-    """
+    """Call LLM with 10s timeout. Returns response or fallback string."""
     client = _get_client()
     if client is None:
         return (
-            "LLM not available. Set OPENAI_API_KEY (or LLM_API_KEY) and optionally OPENAI_BASE_URL "
-            "for an OpenAI-compatible API."
+            "LLM not available. Set OPENAI_API_KEY (or LLM_API_KEY) and optionally OPENAI_BASE_URL."
         )
     model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-    try:
-        r = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            max_tokens=max_tokens,
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+    def do_create(c):
+        return c.chat.completions.create(
+            model=model, messages=messages, max_tokens=max_tokens, timeout=_LLM_TIMEOUT_SEC
         )
+
+    try:
+        r = do_create(client)
         if r.choices and len(r.choices) > 0:
             return (r.choices[0].message.content or "").strip()
     except Exception as e:
-        return f"Error calling LLM: {e}"
+        err_str = str(e).lower()
+        if "connection" in err_str or "protocol" in err_str or "base_url" in err_str or "timeout" in err_str:
+            try:
+                from openai import OpenAI
+                api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("LLM_API_KEY")
+                fallback = OpenAI(api_key=api_key, base_url=_OPENAI_DEFAULT_BASE, timeout=_LLM_TIMEOUT_SEC)
+                r = do_create(fallback)
+                if r.choices and len(r.choices) > 0:
+                    return (r.choices[0].message.content or "").strip()
+            except Exception:
+                pass
+        return f"Error calling LLM (timeout or connection): {e}"
     return "No response from model."
 
 
-# Hospital profile passed to LLM for context (decision-support assumptions)
+def _cached_call(cache_key: str, fn, *args, **kwargs) -> str:
+    """Return cached response if same key within _CACHE_TTL_SEC."""
+    now = time.time()
+    if cache_key in _response_cache:
+        ts, resp = _response_cache[cache_key]
+        if now - ts < _CACHE_TTL_SEC:
+            return resp
+    out = fn(*args, **kwargs)
+    _response_cache[cache_key] = (now, out)
+    return out
+
+
 _HOSPITAL_PROFILE = {
     "icu_total_beds": 50,
     "icu_high_risk_occupancy_pct": 90,
@@ -81,91 +150,137 @@ _SYSTEM_PROMPT = """You are a hospital decision-support AI. Your role is to:
 You do NOT generate raw predictions or invent numbers. Use ONLY the data in the user message. If data is missing or insufficient, say so. Keep language clear and suitable for clinicians and administrators."""
 
 
-def generate_operational_summary() -> str:
+def generate_operational_summary(data_context: dict) -> str:
     """
-    Generate a short operational summary using current hospital metrics from Supabase.
+    Generate operational summary using ONLY the provided data_context (from get_system_strain).
+    This ensures the AI uses the same numbers as the dashboard KPIs.
     """
-    total = get_total_patients()
-    icu = get_icu_occupancy()
-    high_readmission = get_high_readmission_patients(limit=5)
-    no_shows = get_likely_no_shows(days_ahead=1)
-    trend = get_admissions_trend(days=7)
-    dept_no_show = get_department_no_show_rates()
+    if not _AI_AVAILABLE:
+        icu = data_context.get("icu_occupied", 0)
+        total = data_context.get("icu_total", 50)
+        score = data_context.get("strain_score", 0)
+        return (
+            f"ICU at {icu}/{total} beds. "
+            f"System strain score: {score:.0f}/100. "
+            "AI analysis unavailable — check OPENAI_API_KEY."
+        )
+    try:
+        def _do():
+            data = {
+                "hospital_profile": _HOSPITAL_PROFILE,
+                "strain": data_context,
+                "high_readmission_patient_count": data_context.get("high_readmission_count", 0),
+                "likely_no_shows_tomorrow_count": data_context.get("likely_no_show_count", 0),
+            }
+            trend = _as_list(data_context.get("admissions_trend_records"))
+            dept = _as_list(data_context.get("department_no_show_records"))
+            data["admissions_trend_last_7_days"] = trend
+            data["department_no_show_rates"] = dept[:10]
+            user_content = (
+                "Using ONLY the data below, write a brief operational summary (2–4 sentences). "
+                "Reference hospital profile thresholds where relevant. Use the exact counts in the data.\n\n"
+                + json.dumps(data, default=str)
+            )
+            return _call_llm(_SYSTEM_PROMPT, user_content)
 
-    data = {
-        "hospital_profile": _HOSPITAL_PROFILE,
-        "total_patients": total,
-        "icu_occupancy": icu,
-        "high_readmission_patient_count": len(high_readmission),
-        "likely_no_shows_tomorrow_count": len(no_shows),
-        "admissions_trend_last_7_days": trend.to_dict(orient="records") if not trend.empty else [],
-        "department_no_show_rates": dept_no_show.head(10).to_dict(orient="records") if not dept_no_show.empty else [],
-    }
-    user_content = "Using ONLY the data below, write a brief operational summary (2–4 sentences). Reference hospital profile thresholds where relevant.\n\n" + json.dumps(data, default=str)
-    return _call_llm(_SYSTEM_PROMPT, user_content)
-
-
-def explain_patient_risk(patient_id: str | int) -> str:
-    """
-    Explain risk for a specific patient using their history and risk data from Supabase.
-    """
-    history = get_patient_history(patient_id)
-    data = {
-        "hospital_profile": _HOSPITAL_PROFILE,
-        "demographics": history["demographics"],
-        "admissions_count": len(history["admissions"]),
-        "vitals_records_count": len(history["vitals"]),
-        "risk_scores": history["risk_scores"].to_dict(orient="records") if not history["risk_scores"].empty else [],
-    }
-    user_content = (
-        f"Using ONLY the data below for patient_id={patient_id}, interpret this patient's risk profile "
-        "(readmission ≥ 0.6 is flagged; mention vitals only if present). Do not invent numbers.\n\n" + json.dumps(data, default=str)
-    )
-    return _call_llm(_SYSTEM_PROMPT, user_content)
+        key = "summary:" + json.dumps(data_context, default=str, sort_keys=True)[:500]
+        return _cached_call(key, _do)
+    except Exception as e:
+        return f"AI temporarily unavailable: {e}"
 
 
-def predict_capacity_alerts() -> str:
+def explain_patient_risk(patient_id: str | int, history: dict) -> str:
     """
-    Generate capacity-related alerts (e.g. ICU) using current occupancy and trends.
+    Explain risk for a specific patient using the supplied history dict (from get_patient_history).
     """
-    icu = get_icu_occupancy()
-    trend = get_admissions_trend(days=14)
-    data = {
-        "hospital_profile": _HOSPITAL_PROFILE,
-        "icu_occupancy": icu,
-        "admissions_trend": trend.to_dict(orient="records") if not trend.empty else [],
-    }
-    user_content = (
-        "Using ONLY the data below, summarize ICU capacity. ICU occupancy ≥ 90% is high operational risk (50 beds). "
-        "Suggest actions if needed. Do not invent numbers.\n\n" + json.dumps(data, default=str)
-    )
-    return _call_llm(_SYSTEM_PROMPT, user_content)
+    if not _AI_AVAILABLE:
+        n_adm = _safe_len(history.get("admissions"))
+        return f"Patient {patient_id}: {n_adm} admission(s) in history. AI explanation unavailable — check OPENAI_API_KEY."
+    try:
+        def _do():
+            import pandas as pd
+            rs = history.get("risk_scores")
+            risk_records = rs.to_dict(orient="records") if rs is not None and hasattr(rs, "empty") and not rs.empty else []
+            data = {
+                "hospital_profile": _HOSPITAL_PROFILE,
+                "demographics": history.get("demographics", {}),
+                "admissions_count": _safe_len(history.get("admissions")),
+                "vitals_records_count": _safe_len(history.get("vitals")),
+                "risk_scores": risk_records,
+            }
+            user_content = (
+                f"Using ONLY the data below for patient_id={patient_id}, interpret this patient's risk profile "
+                "(readmission ≥ 0.6 is flagged; mention vitals only if present). Do not invent numbers.\n\n"
+                + json.dumps(data, default=str)
+            )
+            return _call_llm(_SYSTEM_PROMPT, user_content)
+
+        rs = history.get("risk_scores")
+        rs_len = len(rs) if rs is not None and hasattr(rs, "__len__") else 0
+        key = f"explain:{patient_id}:{len(history.get('admissions', []))}:{rs_len}"[:200]
+        return _cached_call(key, _do)
+    except Exception as e:
+        return f"AI temporarily unavailable: {e}"
 
 
-def answer_user_question(query: str) -> str:
-    """
-    Answer a natural language question using live data from analytics functions.
-    The LLM receives structured data and must reason only from it.
-    """
-    total = get_total_patients()
-    icu = get_icu_occupancy()
-    high_readmission = get_high_readmission_patients(limit=20)
-    no_shows = get_likely_no_shows(days_ahead=7)
-    trend = get_admissions_trend(days=30)
-    dept_no_show = get_department_no_show_rates()
+def predict_capacity_alerts(data_context: dict) -> str:
+    """Generate capacity-related alerts using the supplied data_context."""
+    if not _AI_AVAILABLE:
+        total = data_context.get("icu_total", 50)
+        occupied = data_context.get("icu_occupied", 0)
+        rate = data_context.get("icu_rate", 0)
+        return f"ICU {occupied}/{total} beds ({rate*100:.0f}% occupancy). AI alerts unavailable — check OPENAI_API_KEY."
+    try:
+        def _do():
+            data = {
+                "hospital_profile": _HOSPITAL_PROFILE,
+                "icu_occupancy": {
+                    "total": data_context.get("icu_total", 0),
+                    "occupied": data_context.get("icu_occupied", 0),
+                    "rate": data_context.get("icu_rate", 0),
+                },
+                "admissions_trend": _as_list(data_context.get("admissions_trend_records")),
+            }
+            user_content = (
+                "Using ONLY the data below, summarize ICU capacity. ICU occupancy ≥ 90% is high operational risk (50 beds). "
+                "Suggest actions if needed. Do not invent numbers.\n\n" + json.dumps(data, default=str)
+            )
+            return _call_llm(_SYSTEM_PROMPT, user_content)
 
-    data = {
-        "hospital_profile": _HOSPITAL_PROFILE,
-        "total_patients": total,
-        "icu_occupancy": icu,
-        "high_readmission_patients": high_readmission.head(20).to_dict(orient="records") if not high_readmission.empty else [],
-        "likely_no_shows_next_7_days_count": len(no_shows),
-        "admissions_trend": trend.to_dict(orient="records") if not trend.empty else [],
-        "department_no_show_rates": dept_no_show.to_dict(orient="records") if not dept_no_show.empty else [],
-    }
-    user_content = (
-        "The user asked a question about the hospital. Interpret and answer using ONLY the data below. "
-        "Do not generate raw predictions or invent numbers. Reference thresholds (e.g. readmission ≥ 0.6, ICU ≥ 90%) where relevant.\n\n"
-        f"User question: {query}\n\nData:\n" + json.dumps(data, default=str)
-    )
-    return _call_llm(_SYSTEM_PROMPT, user_content, max_tokens=1024)
+        key = "capacity:" + json.dumps({k: data_context.get(k) for k in ("icu_rate", "icu_total", "icu_occupied")}, sort_keys=True)
+        return _cached_call(key, _do)
+    except Exception as e:
+        return f"AI temporarily unavailable: {e}"
+
+
+def answer_user_question(question: str, data_context: dict) -> str:
+    """
+    Answer a natural language question using ONLY the supplied data_context.
+    This ensures answers use the same numbers as the dashboard.
+    """
+    if not _AI_AVAILABLE:
+        return (
+            "AI answers unavailable — check OPENAI_API_KEY. "
+            "Use the dashboard KPIs and charts for data."
+        )
+    try:
+        def _do():
+            data = {
+                "hospital_profile": _HOSPITAL_PROFILE,
+                "strain": data_context,
+                "high_readmission_count": data_context.get("high_readmission_count", 0),
+                "likely_no_show_count": data_context.get("likely_no_show_count", 0),
+                "admissions_trend": _as_list(data_context.get("admissions_trend_records")),
+                "department_no_show_rates": _as_list(data_context.get("department_no_show_records")),
+            }
+            user_content = (
+                "The user asked a question about the hospital. Interpret and answer using ONLY the data below. "
+                "Do not generate raw predictions or invent numbers. Reference thresholds (e.g. readmission ≥ 0.6, ICU ≥ 90%) where relevant.\n\n"
+                f"User question: {question}\n\nData:\n" + json.dumps(data, default=str)
+            )
+            return _call_llm(_SYSTEM_PROMPT, user_content, max_tokens=1024)
+
+        key = "answer:" + question.strip()[:100] + ":" + json.dumps(data_context, default=str, sort_keys=True)[:400]
+        return _cached_call(key, _do)
+    except Exception as e:
+        return f"AI temporarily unavailable: {e}"

@@ -4,48 +4,83 @@ Hospital analytics platform using Supabase data, prediction logic, an LLM reason
 
 ## Setup
 
-1. **Create a virtual environment (recommended)**
+1. **Create and activate a virtual environment**
+
+   From the project root, or from `hospital_dashboard`:
 
    ```bash
    cd hospital_dashboard
-   python -m venv .venv
+   python3 -m venv .venv
    source .venv/bin/activate   # Windows: .venv\Scripts\activate
    pip install -r requirements.txt
    ```
 
 2. **Environment variables**
 
+   Copy `.env.example` to `.env` in the `hospital_dashboard` directory and fill in:
+
    - **Required for Supabase (database):**
      - `SUPABASE_URL` – your Supabase project URL
-     - `SUPABASE_KEY` – your Supabase anon/service key
+     - `SUPABASE_SERVICE_ROLE_KEY` or `SUPABASE_KEY` – your Supabase key
 
    - **Optional for LLM (AI Assistant, summaries, explanations):**
      - `OPENAI_API_KEY` or `LLM_API_KEY` – API key for an OpenAI-compatible API
-     - `OPENAI_BASE_URL` – base URL if using a different provider (e.g. local LLM)
+     - `OPENAI_BASE_URL` – base URL if using a different provider (leave unset for OpenAI cloud)
      - `LLM_MODEL` – model name (default: `gpt-4o-mini`)
 
    Example (Unix/macOS):
 
    ```bash
    export SUPABASE_URL="https://xxxx.supabase.co"
-   export SUPABASE_KEY="your-anon-key"
+   export SUPABASE_SERVICE_ROLE_KEY="your-service-role-key"
    export OPENAI_API_KEY="sk-..."
    ```
 
+   Or use a `.env` file in `hospital_dashboard/` (do not commit it).  
+   `.venv` and `.env` are in `.gitignore` and will not be committed.
+
+## Debugging empty tables (High Risk Patients / Appointment Operations)
+
+If the **High Risk Patients** or **Appointment Operations** panels show loading or no data:
+
+1. **Verify Supabase data** (from `hospital_dashboard`):
+   ```bash
+   .venv/bin/python verify_supabase_data.py
+   ```
+   This checks `risk_scores` (column `readmission_risk`) and `appointments` (columns `department`, `no_show`).
+
+2. **Enable debug logging** to see the full data pipeline (Supabase query results, dataframe shapes, filter results):
+   ```bash
+   DEBUG=1 ./run.sh
+   ```
+   Logs are structured by stage: `[Supabase]`, `[HighRisk]`, `[NoShow]`, `[Shiny]`. Errors are always printed (even without DEBUG). Empty results print a one-line diagnostic; set `DEBUG=1` for full pipeline logs.
+
+3. **Schema**: Tables must have:
+   - `risk_scores`: `patient_id`, `readmission_risk` (numeric, ≥ 0.6 for high risk)
+   - `appointments`: `department` (or column containing "department"), `no_show` (bool) or `status`/`outcome`
+
 ## Run the dashboard
 
-From the `hospital_dashboard` directory:
+From the `hospital_dashboard` directory, use the run script (uses `.venv` automatically; no need to activate):
+
+```bash
+./run.sh
+```
+
+On Windows: double-click `run.bat` or run `run.bat` in a terminal.
+
+Then open the URL shown (e.g. http://127.0.0.1:8000).
+
+**Alternative** (with venv already activated):
 
 ```bash
 shiny run app.py
 ```
 
-Then open the URL shown (e.g. http://127.0.0.1:8000).
+Options (pass after `./run.sh`):
 
-Options:
-
-- `shiny run --reload app.py` – auto-reload on file changes  
-- `shiny run --launch-browser app.py` – open browser automatically  
+- `./run.sh --reload` – auto-reload on file changes  
+- `./run.sh --launch-browser` – open browser automatically  
 
 ## Project structure
 
