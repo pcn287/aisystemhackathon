@@ -291,3 +291,152 @@ def get_patient_history(patient_id: str | int) -> dict[str, Any]:
         "admissions": adm,
         "risk_scores": risk,
     }
+
+
+def predict_icu_capacity_reach_90() -> dict[str, Any]:
+    """
+    Q2: Under today's admission forecast, when will ICU capacity reach 90%?
+    Uses historical ICU-required admissions to estimate days until 90%.
+    """
+    icu = get_icu_occupancy()
+    admissions = get_admissions()
+    trend = get_admissions_trend(days=30)
+
+    total = icu.get("total", 50)
+    occupied = icu.get("occupied", 0)
+    target = min(45, int(total * 0.9))  # 90% of 50 = 45
+    beds_until_90 = target - occupied
+
+    result = {
+        "current_occupied": occupied,
+        "total_beds": total,
+        "target_90pct": target,
+        "beds_until_90": beds_until_90,
+        "already_at_risk": occupied >= target,
+        "estimated_days": None,
+        "forecast_note": "",
+    }
+
+    if beds_until_90 <= 0:
+        result["forecast_note"] = "ICU is already at or above 90% capacity. Immediate action recommended."
+        return result
+
+    adate = _safe_date_col(admissions, ["admission_date", "admit_date", "start_date", "date"])
+    icu_col = "icu_required" if "icu_required" in admissions.columns else None
+    if adate and icu_col and not admissions.empty:
+        adm = admissions.copy()
+        adm[adate] = pd.to_datetime(adm[adate], errors="coerce")
+        adm = adm.dropna(subset=[adate])
+        cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=30)
+        recent = adm[adm[adate] >= cutoff]
+        if not recent.empty:
+            icu_adm = recent[recent[icu_col] == True]
+            days_span = max(1, (recent[adate].max() - recent[adate].min()).days)
+            avg_icu = len(icu_adm) / days_span
+            if avg_icu > 0:
+                result["estimated_days"] = round(beds_until_90 / avg_icu, 1)
+                result["forecast_note"] = f"At current rate (~{avg_icu:.1f} ICU admissions/day), 90% in ~{result['estimated_days']:.0f} days."
+
+    if result["estimated_days"] is None and not trend.empty and "admissions" in trend.columns:
+        avg_adm = trend["admissions"].mean()
+        proxy_icu = max(0.1, avg_adm * 0.15)
+        result["estimated_days"] = round(beds_until_90 / proxy_icu, 1)
+        result["forecast_note"] = f"Based on admission trend (proxy ~{proxy_icu:.1f} ICU/day), 90% in ~{result['estimated_days']:.0f} days."
+
+    if result["forecast_note"] == "":
+        result["forecast_note"] = "Insufficient data for forecast. Monitor admissions closely."
+
+    return result
+
+
+def get_similar_patients(patient_id: str | int, n: int = 5) -> dict[str, Any]:
+    """
+    Q3: Find historical cases with similar risk factors for comparison.
+    """
+    pid = str(patient_id)
+    risk_df = get_risk_scores()
+    patients = get_patients()
+    admissions = get_admissions()
+
+    if risk_df.empty or "patient_id" not in risk_df.columns:
+        return {"patient_id": pid, "similar": [], "patient_profile": {}, "note": "No risk scores."}
+
+    score_cols = [c for c in ["readmission_risk", "icu_risk", "no_show_risk"] if c in risk_df.columns]
+    if not score_cols:
+        return {"patient_id": pid, "similar": [], "patient_profile": {}, "note": "Risk columns not found."}
+
+    patient_row = risk_df[risk_df["patient_id"].astype(str) == pid]
+    if patient_row.empty:
+        return {"patient_id": pid, "similar": [], "patient_profile": {}, "note": "Patient not found."}
+
+    patient_scores = patient_row[score_cols].iloc[0].fillna(0)
+    others = risk_df[risk_df["patient_id"].astype(str) != pid].copy()
+    others[score_cols] = others[score_cols].fillna(0)
+    diff = others[score_cols] - patient_scores.values
+    others["_dist"] = (diff ** 2).sum(axis=1) ** 0.5
+    top = others.nsmallest(n, "_dist")
+
+    similar_list = []
+    for _, row in top.iterrows():
+        spid = str(row["patient_id"])
+        rec = {"patient_id": spid, "readmission_risk": row.get("readmission_risk"), "icu_risk": row.get("icu_risk"), "no_show_risk": row.get("no_show_risk")}
+        if not patients.empty:
+            prow = patients[patients["patient_id"].astype(str) == spid]
+            if not prow.empty:
+                rec["age"] = prow.iloc[0].get("age")
+                rec["primary_diagnosis"] = prow.iloc[0].get("primary_diagnosis")
+        if not admissions.empty:
+            rec["admission_count"] = len(admissions[admissions["patient_id"].astype(str) == spid])
+        similar_list.append(rec)
+
+    profile = patient_row.iloc[0].to_dict()
+    if not patients.empty:
+        prow = patients[patients["patient_id"].astype(str) == pid]
+        if not prow.empty:
+            profile.update(prow.iloc[0].to_dict())
+
+    return {"patient_id": pid, "patient_profile": profile, "similar": similar_list}
+
+
+def get_patient_risk_merged() -> pd.DataFrame:
+    """
+    Return merged patients + risk_scores for exploratory analysis and regression plots.
+    """
+    patients = get_patients()
+    risk_scores = get_risk_scores()
+    if patients.empty or risk_scores.empty:
+        return pd.DataFrame()
+    patients = patients.copy()
+    patients["patient_id"] = patients["patient_id"].astype(str)
+    risk_scores = risk_scores.copy()
+    risk_scores["patient_id"] = risk_scores["patient_id"].astype(str)
+    return patients.merge(risk_scores, on="patient_id", how="inner")
+
+
+def get_descriptive_stats(df: pd.DataFrame, numeric_cols: list[str] | None = None) -> dict[str, dict]:
+    """Return descriptive stats (count, mean, sd, min, max) for numeric columns."""
+    if df.empty:
+        return {}
+    if numeric_cols is None:
+        numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    numeric_cols = [c for c in numeric_cols if c in df.columns]
+    out = {}
+    for col in numeric_cols:
+        s = df[col].dropna()
+        out[col] = {"count": len(s), "mean": round(s.mean(), 4), "sd": round(s.std(), 4) if len(s) > 1 else 0, "min": s.min(), "max": s.max()}
+    return out
+
+
+def get_vitals_summary(sample_size: int = 3000) -> dict[str, Any]:
+    """
+    Return descriptive stats for post-discharge vitals (heart_rate, systolic_bp, oxygen_saturation, etc.).
+    Uses a sample for performance. Includes sample DataFrame for charting.
+    """
+    vitals = get_vitals()
+    if vitals.empty:
+        return {"n_records": 0, "n_patients": 0, "stats": {}, "sample": pd.DataFrame()}
+    vitals = vitals.head(sample_size)
+    cols = [c for c in ["heart_rate", "systolic_bp", "respiratory_rate", "oxygen_saturation", "temperature"] if c in vitals.columns]
+    stats = get_descriptive_stats(vitals, cols)
+    n_patients = vitals["patient_id"].nunique() if "patient_id" in vitals.columns else 0
+    return {"n_records": len(vitals), "n_patients": n_patients, "stats": stats, "sample": vitals}
