@@ -1,23 +1,12 @@
 """
-Hospital Digital Twin — Streamlit Dashboard
+Hospital Operations Command Center — Streamlit Dashboard
 
-Uses the same analytics layer (hospital_analytics.py) and Supabase backend as the
-Shiny app. This file is standalone; it does not modify app.py, hospital_analytics.py,
-or database_connection.py.
-
-How to run:
-
-    pip install streamlit plotly
-    streamlit run streamlit_dashboard.py
-
-Or from the hospital_dashboard directory:
-
-    streamlit run streamlit_dashboard.py
-
-Environment: Ensure .env (or environment) has SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY
-(or SUPABASE_KEY). Optional: OPENAI_API_KEY for AI features.
+Uses hospital_analytics, database_connection, and optional LLM (hospital_ai_agent).
+Run: streamlit run streamlit_dashboard.py
+Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_KEY); optional OPENAI_API_KEY.
 """
 
+import html as html_module
 import os
 import pandas as pd
 import streamlit as st
@@ -37,7 +26,16 @@ from hospital_analytics import (
     get_patient_id_list,
     get_patient_history,
 )
-from hospital_ai_agent import answer_user_question
+from hospital_ai_agent import answer_user_question, explain_patient_risk
+from database_connection import get_patients, get_risk_scores, get_icu_beds
+from data_queries import get_trend_data
+from analytics import analyze_readmission_drivers, hospital_strain_score
+from forecasting import predict_icu_load
+from llm_insights import (
+    generate_operational_recommendations,
+    generate_situation_brief,
+    patient_digital_twin_insight,
+)
 
 
 def _records_to_df(records):
@@ -82,16 +80,198 @@ def load_patient_ids():
     return get_patient_id_list()
 
 
+@st.cache_data(ttl=60)
+def load_trend_data(metric_name: str, days_7: bool = True):
+    """Cached trend data for ICU, readmission, no-show."""
+    try:
+        return get_trend_data(metric_name, days_7=days_7)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=60)
+def load_patients_table():
+    """Build merged patient list: patients + risk_scores + icu_status (for drill-down lists)."""
+    try:
+        patients = get_patients()
+        risk = get_risk_scores()
+        icu = get_icu_beds()
+        if patients is None or patients.empty:
+            return pd.DataFrame()
+        df = patients.copy()
+        pid_col = "patient_id" if "patient_id" in df.columns else df.columns[0]
+        if risk is not None and not risk.empty and "patient_id" in risk.columns:
+            risk_sub = risk[[c for c in risk.columns if c in ["patient_id", "readmission_risk", "no_show_risk", "icu_risk"]]].drop_duplicates(subset=["patient_id"], keep="last")
+            df = df.merge(risk_sub, on="patient_id", how="left", suffixes=("", "_risk"))
+        if icu is not None and not icu.empty and "patient_id" in icu.columns:
+            occ_col = "is_occupied" if "is_occupied" in icu.columns else "occupied"
+            if occ_col in icu.columns:
+                occupied_beds = icu[icu[occ_col] == True]
+            else:
+                occupied_beds = icu
+            icu_ids = set(occupied_beds["patient_id"].dropna().astype(str).unique())
+            df["icu_status"] = df[pid_col].astype(str).map(lambda x: "Yes" if x in icu_ids else "No")
+        else:
+            df["icu_status"] = "No"
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
 def _plotly_layout():
     return dict(
-        paper_bgcolor="#131F35",
-        plot_bgcolor="#0B1120",
-        font=dict(color="#F0F6FF"),
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#F6F8FB",
+        font=dict(color="#1A1A1A"),
         margin=dict(t=30, b=40, l=50, r=20),
-        xaxis=dict(gridcolor="#1E3A5F", showgrid=True),
-        yaxis=dict(gridcolor="#1E3A5F", showgrid=True),
-        legend=dict(bgcolor="#1A2942", bordercolor="#1E3A5F"),
+        xaxis=dict(gridcolor="#E5E7EB", showgrid=True),
+        yaxis=dict(gridcolor="#E5E7EB", showgrid=True),
+        legend=dict(bgcolor="#FFFFFF", bordercolor="#E5E7EB"),
     )
+
+
+def _render_drilldown_page(strain, diagnosis_filter):
+    """Render patient list or patient twin page based on st.session_state.page."""
+    page = st.session_state.page
+    if page == "patient_twin" and st.session_state.patient_twin_id:
+        _render_patient_twin(strain, st.session_state.patient_twin_id)
+        return
+    # Patient list pages
+    try:
+        df = load_patients_table()
+    except Exception as e:
+        st.error(f"Failed to load patients: {e}")
+        df = pd.DataFrame()
+    if df.empty:
+        st.warning("No patient data available.")
+        return
+    # Apply list-type filter
+    if page == "icu_patients" and "icu_status" in df.columns:
+        df = df[df["icu_status"].astype(str).str.lower() == "yes"]
+    elif page == "readmission_risk":
+        try:
+            high_df = load_readmission(limit=500)
+            if high_df is not None and not high_df.empty and "patient_id" in high_df.columns:
+                ids = set(high_df["patient_id"].astype(str))
+                pid_col = "patient_id" if "patient_id" in df.columns else df.columns[0]
+                df = df[df[pid_col].astype(str).isin(ids)]
+        except Exception:
+            pass
+    elif page == "no_shows":
+        try:
+            noshow_df = load_noshow_patients()
+            if noshow_df is not None and not noshow_df.empty and "patient_id" in noshow_df.columns:
+                ids = set(noshow_df["patient_id"].astype(str))
+                pid_col = "patient_id" if "patient_id" in df.columns else df.columns[0]
+                df = df[df[pid_col].astype(str).isin(ids)]
+        except Exception:
+            pass
+    # Sidebar filters
+    age_col = None
+    for c in ["age", "date_of_birth", "dob"]:
+        if c in df.columns:
+            age_col = c
+            break
+    if age_col and age_col == "age":
+        df = df[(df["age"] >= st.session_state.sidebar_age_min) & (df["age"] <= st.session_state.sidebar_age_max)]
+    if diagnosis_filter and diagnosis_filter.strip():
+        diag_col = next((c for c in df.columns if "diagn" in c.lower() or "condition" in c.lower()), None)
+        if diag_col is not None:
+            df = df[df[diag_col].astype(str).str.lower().str.contains(diagnosis_filter.strip().lower(), na=False)]
+    if st.session_state.sidebar_high_risk_only and "readmission_risk" in df.columns:
+        df = df[df["readmission_risk"] >= 0.6]
+    if st.session_state.sidebar_icu_only and "icu_status" in df.columns:
+        df = df[df["icu_status"].astype(str).str.lower() == "yes"]
+    # Title
+    titles = {"patients": "All Patients", "icu_patients": "ICU Patients", "readmission_risk": "High Readmission Risk", "no_shows": "Likely No-Shows"}
+    st.markdown(f"#### {titles.get(page, 'Patients')}")
+    # Search
+    search = st.text_input("Search (patient ID, name, diagnosis)", key="list_search")
+    if search and search.strip():
+        pid_col = "patient_id" if "patient_id" in df.columns else df.columns[0]
+        mask = df.astype(str).apply(lambda row: row.str.contains(search.strip(), case=False, na=False).any(), axis=1)
+        df = df[mask]
+    # Patient selection dropdown
+    pid_col = "patient_id" if "patient_id" in df.columns else df.columns[0]
+    ids = [""] + df[pid_col].astype(str).unique().tolist()[:500]
+    selected = st.selectbox("Select patient", ids, format_func=lambda x: "Select patient..." if x == "" else x, key="list_select")
+    if st.button("Open Digital Twin", type="primary", key="open_twin_btn") and selected:
+        st.session_state.patient_twin_id = selected
+        st.session_state.page = "patient_twin"
+        st.rerun()
+    # Table
+    preferred = ["patient_id", "age", "gender", "diagnosis", "heart_rate", "blood_pressure", "oxygen_saturation", "oxygen", "icu_status", "readmission_risk", "no_show_risk"]
+    display_cols = [c for c in preferred if c in df.columns]
+    if not display_cols:
+        display_cols = list(df.columns)[:12]
+    st.dataframe(df[display_cols].head(200) if display_cols else df.head(200), use_container_width=True, hide_index=True)
+
+
+def _render_patient_twin(strain, patient_id):
+    """Single patient Digital Twin view with vitals, risk, and AI explanation."""
+    st.markdown(f"#### Patient Digital Twin — {patient_id}")
+    try:
+        hist = get_patient_history(patient_id)
+    except Exception as e:
+        st.error(f"Failed to load patient: {e}")
+        return
+    dem = hist.get("demographics", {})
+    risk_scores = hist.get("risk_scores", pd.DataFrame())
+    vitals = hist.get("vitals", pd.DataFrame())
+    admissions = hist.get("admissions", pd.DataFrame())
+    # Patient info
+    st.markdown("**Patient Information**")
+    if dem:
+        cols = st.columns(3)
+        items = list(dem.items())
+        for i, (k, v) in enumerate(items[:9]):
+            cols[i % 3].metric(k.replace("_", " ").title(), str(v))
+    else:
+        st.caption("No demographics.")
+    # Vitals
+    st.markdown("**Vitals**")
+    if vitals is not None and not vitals.empty:
+        v = vitals.tail(20)
+        num_cols = v.select_dtypes(include="number").columns.tolist()
+        if num_cols:
+            st.line_chart(v[num_cols[:4]] if len(num_cols) >= 4 else v[num_cols])
+        st.dataframe(v.tail(10), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No vitals.")
+    # Risk scores
+    st.markdown("**Risk Scores**")
+    if risk_scores is not None and not risk_scores.empty:
+        for c in risk_scores.columns:
+            if c == "patient_id":
+                continue
+            val = risk_scores[c].iloc[0]
+            color = "#DC2626" if val >= 0.8 else "#F59E0B" if val >= 0.5 else "#16A34A"
+            st.metric(c.replace("_", " ").title(), f"{float(val):.2f}")
+    else:
+        st.caption("No risk scores.")
+    # ICU status
+    st.markdown("**ICU status**")
+    icu_occupied = strain.get("icu_occupied", 0)
+    st.caption(f"ICU occupancy: {icu_occupied} / {strain.get('icu_total', 50)} beds.")
+    # AI Risk Explanation
+    st.markdown("**AI Risk Explanation**")
+    with st.spinner("Generating explanation..."):
+        try:
+            explanation = explain_patient_risk(patient_id, hist)
+            st.markdown(explanation)
+        except Exception as e:
+            st.warning("AI insights temporarily unavailable.")
+    # Patient Digital Twin Insight (readmission probability, risk factors, follow-up)
+    st.markdown("**Patient Digital Twin Insight**")
+    with st.spinner("Generating insight..."):
+        try:
+            twin_insight = patient_digital_twin_insight(patient_id, hist)
+            st.markdown(twin_insight)
+        except Exception as e:
+            st.warning("AI insights temporarily unavailable.")
+    if admissions is not None and not admissions.empty:
+        st.markdown("**Admission History**")
+        st.dataframe(admissions, use_container_width=True, hide_index=True)
 
 
 def main():
@@ -99,101 +279,150 @@ def main():
         page_title="Hospital Operations Command Center",
         page_icon="🏥",
         layout="wide",
-        initial_sidebar_state="collapsed",
+        initial_sidebar_state="expanded",
     )
+
+    # Navigation state
+    if "page" not in st.session_state:
+        st.session_state.page = "dashboard"
+    if "patient_twin_id" not in st.session_state:
+        st.session_state.patient_twin_id = None
+    if "sidebar_age_min" not in st.session_state:
+        st.session_state.sidebar_age_min = 0
+    if "sidebar_age_max" not in st.session_state:
+        st.session_state.sidebar_age_max = 120
+    if "sidebar_icu_only" not in st.session_state:
+        st.session_state.sidebar_icu_only = False
+    if "sidebar_high_risk_only" not in st.session_state:
+        st.session_state.sidebar_high_risk_only = False
+    if "sidebar_risk_min" not in st.session_state:
+        st.session_state.sidebar_risk_min = 0.6
+    if "sidebar_risk_max" not in st.session_state:
+        st.session_state.sidebar_risk_max = 1.0
+    if "sidebar_readmit_dept" not in st.session_state:
+        st.session_state.sidebar_readmit_dept = "All"
 
     # Load strain first (used in navbar and throughout)
     try:
         strain = load_strain()
     except Exception as e:
-        st.error(f"Failed to load data: {e}")
+        st.error("Unable to load hospital data.")
+        st.caption(str(e))
         st.stop()
 
-    # ─── CSS Theme ────────────────────────────────────────────────────────
+    # ─── CSS Theme (light, professional healthcare) ─────────────────────────
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
     
-    .stApp { 
-        background-color: #0B1120; 
+    /* Main app: light neutral background */
+    .stApp {
+        background-color: #F6F8FB;
         font-family: 'DM Sans', sans-serif;
-        color: #F0F6FF;
+        color: #1A1A1A;
     }
     
+    /* Sidebar: white card, subtle border */
     [data-testid="stSidebar"] {
-        background-color: #131F35;
-        border-right: 1px solid #1E3A5F;
+        background-color: #FFFFFF;
+        border-right: 1px solid #E5E7EB;
     }
+    [data-testid="stSidebar"] .stMarkdown { color: #1A1A1A; }
     
+    /* Tabs: light bar, medical blue accent */
     .stTabs [data-baseweb="tab-list"] {
-        background-color: #131F35;
-        border-bottom: 1px solid #1E3A5F;
+        background-color: #FFFFFF;
+        border-bottom: 1px solid #E5E7EB;
         padding: 0 16px;
         gap: 4px;
+        border-radius: 12px 12px 0 0;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.06);
     }
     .stTabs [data-baseweb="tab"] {
-        color: #6B8CAE;
+        color: #6B7280;
         font-size: 0.85rem;
         font-weight: 500;
         padding: 12px 20px;
-        border-radius: 0;
+        border-radius: 8px 8px 0 0;
         border-bottom: 2px solid transparent;
     }
     .stTabs [data-baseweb="tab"][aria-selected="true"] {
-        color: #3B82F6 !important;
-        border-bottom: 2px solid #3B82F6 !important;
+        color: #1F4E79 !important;
+        border-bottom: 2px solid #3A7BD5 !important;
         background: transparent !important;
     }
     
+    /* KPI / metric cards: white, soft shadow, readable hierarchy */
     [data-testid="stMetric"] {
-        background: #131F35;
-        border: 1px solid #1E3A5F;
+        background: #FFFFFF;
+        border: 1px solid #E5E7EB;
         border-radius: 12px;
         padding: 20px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.06);
     }
-    [data-testid="stMetricLabel"] { 
-        color: #6B8CAE; 
+    [data-testid="stMetricLabel"] {
+        color: #6B7280;
         font-size: 0.7rem;
         text-transform: uppercase;
         letter-spacing: 0.08em;
     }
-    [data-testid="stMetricValue"] { 
-        color: #F0F6FF;
+    [data-testid="stMetricValue"] {
+        color: #1A1A1A;
         font-family: 'DM Mono', monospace;
-        font-size: 1.8rem;
+        font-size: 36px;
+        font-weight: 600;
     }
     
+    /* Cards: white container, rounded, soft shadow */
     .hd-card {
-        background: #131F35;
-        border: 1px solid #1E3A5F;
+        background: #FFFFFF;
+        border: 1px solid #E5E7EB;
         border-radius: 12px;
         padding: 20px;
         margin-bottom: 16px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.06);
     }
     .hd-card-title {
         font-size: 0.7rem;
         text-transform: uppercase;
         letter-spacing: 0.1em;
-        color: #6B8CAE;
+        color: #6B7280;
         margin-bottom: 12px;
     }
     
-    .banner-normal  { background:#065F46; color:#ECFDF5; padding:16px 20px; border-radius:10px; margin-bottom:16px; }
-    .banner-caution { background:#78350F; color:#FFFBEB; padding:16px 20px; border-radius:10px; margin-bottom:16px; }
-    .banner-critical{ background:#7F1D1D; color:#FEF2F2; padding:16px 20px; border-radius:10px; margin-bottom:16px; animation: pulse 1.5s infinite; }
+    /* Banners: success / warning / danger */
+    .banner-normal  { background:#16A34A; color:#fff; padding:16px 20px; border-radius:10px; margin-bottom:16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    .banner-caution { background:#F59E0B; color:#1A1A1A; padding:16px 20px; border-radius:10px; margin-bottom:16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    .banner-critical{ background:#DC2626; color:#fff; padding:16px 20px; border-radius:10px; margin-bottom:16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); animation: pulse 1.5s infinite; }
     
+    /* Tables */
     .hd-table { width:100%; border-collapse:collapse; font-size:0.85rem; }
-    .hd-table th { background:#1A2942; color:#6B8CAE; padding:8px 12px; text-align:left; font-size:0.7rem; text-transform:uppercase; letter-spacing:0.05em; }
-    .hd-table td { padding:8px 12px; border-bottom:1px solid #1E3A5F; color:#F0F6FF; }
-    .hd-table tr:hover td { background:#1A2942; }
+    .hd-table th { background:#F6F8FB; color:#6B7280; padding:8px 12px; text-align:left; font-size:0.7rem; text-transform:uppercase; letter-spacing:0.05em; border-bottom:1px solid #E5E7EB; }
+    .hd-table td { padding:8px 12px; border-bottom:1px solid #E5E7EB; color:#1A1A1A; }
+    .hd-table tr:hover td { background:#F6F8FB; }
     
-    .risk-critical { background:#7F1D1D; color:#FCA5A5; padding:3px 10px; border-radius:20px; font-size:0.75rem; font-family:'DM Mono',monospace; }
-    .risk-high     { background:#78350F; color:#FCD34D; padding:3px 10px; border-radius:20px; font-size:0.75rem; font-family:'DM Mono',monospace; }
-    .risk-moderate { background:#1A2942; color:#93C5FD; padding:3px 10px; border-radius:20px; font-size:0.75rem; font-family:'DM Mono',monospace; }
+    /* Risk badges */
+    .risk-critical { background:#DC2626; color:#fff; padding:3px 10px; border-radius:20px; font-size:0.75rem; font-family:'DM Mono',monospace; }
+    .risk-high     { background:#F59E0B; color:#1A1A1A; padding:3px 10px; border-radius:20px; font-size:0.75rem; font-family:'DM Mono',monospace; }
+    .risk-moderate { background:#3A7BD5; color:#fff; padding:3px 10px; border-radius:20px; font-size:0.75rem; font-family:'DM Mono',monospace; }
     
+    /* Bed grid: occupied = red, free = green */
     .bed-grid { display:grid; grid-template-columns:repeat(10, 36px); gap:6px; }
-    .bed-occ  { width:36px; height:36px; background:#EF4444; border-radius:6px; }
-    .bed-free { width:36px; height:36px; background:#10B981; border-radius:6px; }
+    .bed-occ  { width:36px; height:36px; background:#DC2626; border-radius:6px; box-shadow: 0 1px 2px rgba(0,0,0,0.08); }
+    .bed-free { width:36px; height:36px; background:#16A34A; border-radius:6px; box-shadow: 0 1px 2px rgba(0,0,0,0.08); }
+    
+    /* Buttons: medical blue, rounded */
+    .stButton > button {
+        background-color: #3A7BD5 !important;
+        color: #FFFFFF !important;
+        border-radius: 8px;
+        border: none;
+        font-weight: 500;
+    }
+    .stButton > button:hover {
+        background-color: #1F4E79 !important;
+        color: #FFFFFF !important;
+    }
     
     #MainMenu { visibility: hidden; }
     footer { visibility: hidden; }
@@ -203,21 +432,21 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
-    # ─── Top Navbar ───────────────────────────────────────────────────────
-    strain_color = "#EF4444" if strain.get("strain_level") == "critical" else "#F59E0B" if strain.get("strain_level") == "elevated" else "#10B981"
+    # ─── Top Navbar (gradient header) ──────────────────────────────────────
+    strain_color = "#DC2626" if strain.get("strain_level") == "critical" else "#F59E0B" if strain.get("strain_level") == "elevated" else "#16A34A"
     st.markdown(f"""
     <div style="display:flex; align-items:center; justify-content:space-between;
-                padding:16px 24px; background:#131F35; 
-                border-bottom:1px solid #1E3A5F; margin-bottom:24px;">
+                padding:16px 24px; background: linear-gradient(90deg, #1F4E79, #3A7BD5);
+                border-radius: 12px; margin-bottom: 24px; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">
         <div style="display:flex; align-items:center; gap:12px;">
             <span style="font-size:1.5rem;">🏥</span>
-            <span style="font-weight:700; font-size:1.1rem; color:#F0F6FF;">
+            <span style="font-weight:700; font-size:1.1rem; color:#FFFFFF;">
                 Hospital Operations Command Center
             </span>
         </div>
-        <div style="color:#6B8CAE; font-size:0.8rem;">
-            Data as of: {strain.get('data_as_of', 'unknown')} &nbsp;|&nbsp; 
-            Strain: <span style="color:{strain_color};">{str(strain.get('strain_level', 'unknown')).upper()}</span>
+        <div style="color:rgba(255,255,255,0.95); font-size:0.8rem;">
+            Data as of: {strain.get('data_as_of', 'unknown')} &nbsp;|&nbsp;
+            Strain: <span style="color:{strain_color}; font-weight:600;">{str(strain.get('strain_level', 'unknown')).upper()}</span>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -234,7 +463,73 @@ def main():
     icu_total = strain.get("icu_total") or 50
     discharge_pending = strain.get("discharge_pending") or 0
 
-    # ─── Tabs ─────────────────────────────────────────────────────────────
+    # Operational Risk Score (decision support formula: 0.5*ICU + 0.3*readmit + 0.2*noshow)
+    op_score, op_status = hospital_strain_score(
+        icu_rate / 100.0, (readmit_rate / 100.0) if total_patients else 0, (noshow_rate / 100.0) if total_patients else 0
+    )
+    if op_status == "normal":
+        st.success(f"**Hospital Strain Score: {op_score:.0f}/100** — Status: {op_status.capitalize()}")
+    elif op_status == "elevated":
+        st.warning(f"**Hospital Strain Score: {op_score:.0f}/100** — Status: {op_status.capitalize()}")
+    else:
+        st.error(f"**Hospital Strain Score: {op_score:.0f}/100** — Status: {op_status.capitalize()}")
+
+    # ─── Sidebar: navigation + filters ─────────────────────────────────────
+    with st.sidebar:
+        st.markdown("### Navigation")
+        if st.session_state.page != "dashboard":
+            if st.button("← Back to Dashboard", type="primary", use_container_width=True):
+                st.session_state.page = "dashboard"
+                st.session_state.patient_twin_id = None
+                st.rerun()
+        st.markdown("---")
+        st.markdown("### Filters (patient lists)")
+        age_min = st.number_input("Age min", 0, 120, int(st.session_state.sidebar_age_min), key="age_min")
+        age_max = st.number_input("Age max", 0, 120, int(st.session_state.sidebar_age_max) or 120, key="age_max")
+        st.session_state.sidebar_age_min = age_min
+        st.session_state.sidebar_age_max = age_max
+        icu_only = st.checkbox("ICU patients only", value=st.session_state.sidebar_icu_only, key="icu_only")
+        high_risk_only = st.checkbox("High readmission risk only", value=st.session_state.sidebar_high_risk_only, key="high_risk_only")
+        st.session_state.sidebar_icu_only = icu_only
+        st.session_state.sidebar_high_risk_only = high_risk_only
+        diagnosis_filter = st.text_input("Diagnosis (contains)", key="diagnosis_filter")
+        with st.expander("Readmission Risk filters"):
+            risk_min = st.slider("Risk score min", 0.0, 1.0, float(st.session_state.sidebar_risk_min), 0.05, key="risk_min")
+            risk_max = st.slider("Risk score max", 0.0, 1.0, float(st.session_state.sidebar_risk_max), 0.05, key="risk_max")
+            st.session_state.sidebar_risk_min = risk_min
+            st.session_state.sidebar_risk_max = risk_max
+            try:
+                _hr = load_readmission(limit=500)
+                dept_options = ["All"]
+                if _hr is not None and not _hr.empty:
+                    for c in _hr.columns:
+                        if "department" in c.lower() or "dept" in c.lower():
+                            dept_options.extend(sorted(_hr[c].dropna().astype(str).unique().tolist()))
+                            break
+                sidebar_readmit_dept = st.selectbox("Department", dept_options, key="readmit_dept")
+                st.session_state.sidebar_readmit_dept = sidebar_readmit_dept
+            except Exception:
+                pass
+        st.markdown("---")
+        st.markdown("### Debug")
+        show_debug = st.checkbox("Show raw data", False, key="show_debug")
+
+    # ─── Drill-down / Patient Twin pages (no tabs) ───────────────────────────
+    if st.session_state.page != "dashboard":
+        _render_drilldown_page(strain, diagnosis_filter)
+        if show_debug:
+            with st.sidebar:
+                st.json(strain)
+        st.markdown("---")
+        st.markdown(
+            f'<div style="text-align:center; color:#6B7280; font-size:0.75rem;">'
+            f'Data as of {strain.get("data_as_of", "unknown")} | Hospital Digital Twin'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    # ─── Tabs (Dashboard) ──────────────────────────────────────────────────
     tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "🏠 Command Center",
         "🛏 ICU Capacity",
@@ -267,37 +562,85 @@ def main():
         </div>
         """, unsafe_allow_html=True)
 
-        # Section B: 4 KPI metrics
+        # AI Hospital Situation Brief (one paragraph for executives)
+        st.markdown("#### AI Hospital Situation Brief")
+        try:
+            brief = generate_situation_brief(strain)
+            st.info(brief)
+        except Exception:
+            st.warning("AI insights temporarily unavailable.")
+
+        # Section B: 4 KPI metrics + drill-down buttons + methodology
         c1, c2, c3, c4 = st.columns(4)
         with c1:
             st.metric("Total Patients", f"{total_patients:,}", delta=None, help="Click ICU Capacity tab for bed detail")
+            if st.button("View Patients", key="kpi_btn_patients", use_container_width=True):
+                st.session_state.page = "patients"
+                st.rerun()
+            with st.expander("How is this calculated?"):
+                st.caption("Total Patients = census count from the patients table (current in-system).")
         with c2:
             st.metric("ICU Occupancy", f"{icu_rate:.1f}%", delta=f"{icu_occupied}/{icu_total} beds", delta_color="inverse")
+            if st.button("View ICU Patients", key="kpi_btn_icu", use_container_width=True):
+                st.session_state.page = "icu_patients"
+                st.rerun()
+            with st.expander("How is ICU occupancy calculated?"):
+                st.markdown("""
+                **ICU Occupancy** = ICU patients / Total ICU beds
+
+                Example:
+                - 45 occupied beds
+                - 50 total beds
+                - **Occupancy = 90%**
+
+                ≥90% is critical; 70–90% is elevated.
+                """)
         with c3:
             st.metric("High Readmission Risk", f"{high_readmit:,}", delta="patients ≥ 0.6 risk", delta_color="inverse", help="Patients with predicted 30-day readmission risk ≥ 60%")
+            if st.button("View High Risk Patients", key="kpi_btn_readmit", use_container_width=True):
+                st.session_state.page = "readmission_risk"
+                st.rerun()
+            with st.expander("How is readmission risk defined?"):
+                st.markdown("""
+                **Readmission Risk** = model-predicted probability of 30-day readmission.
+
+                - **High risk**: score ≥ 0.6 (60%)
+                - **Critical**: score ≥ 0.8 (80%)
+
+                Based on risk_scores table (demographics, vitals, history).
+                """)
         with c4:
             st.metric("Likely No-Shows", f"{likely_noshows}", delta="historical pattern", delta_color="inverse")
+            if st.button("View Likely No-Shows", key="kpi_btn_noshow", use_container_width=True):
+                st.session_state.page = "no_shows"
+                st.rerun()
+            with st.expander("How is no-show risk defined?"):
+                st.markdown("""
+                **No-Show Risk** = predicted likelihood of missing a scheduled appointment.
+
+                Based on historical no-show patterns (department, reminder, distance, etc.).
+                """)
 
         # Section C: Two columns (gauge + bed grid)
         col_left, col_right = st.columns([6, 4])
         with col_left:
             st.markdown('<div class="hd-card-title">ICU CAPACITY GAUGE</div>', unsafe_allow_html=True)
             fig, ax = plt.subplots(figsize=(6, 2))
-            fig.patch.set_facecolor("#131F35")
-            ax.set_facecolor("#131F35")
-            color = "#EF4444" if icu_rate >= 90 else "#F59E0B" if icu_rate >= 70 else "#10B981"
+            fig.patch.set_facecolor("#FFFFFF")
+            ax.set_facecolor("#F6F8FB")
+            color = "#DC2626" if icu_rate >= 80 else "#F59E0B" if icu_rate >= 60 else "#16A34A"
             ax.barh(0, icu_rate, color=color, height=0.5, zorder=3)
-            ax.barh(0, 100, color="#1E3A5F", height=0.5, zorder=2)
-            ax.axvline(x=90, color="#EF4444", linestyle="--", alpha=0.7, linewidth=1.5)
-            ax.axvline(x=70, color="#F59E0B", linestyle="--", alpha=0.7, linewidth=1.5)
+            ax.barh(0, 100, color="#E5E7EB", height=0.5, zorder=2)
+            ax.axvline(x=80, color="#DC2626", linestyle="--", alpha=0.7, linewidth=1.5)
+            ax.axvline(x=60, color="#F59E0B", linestyle="--", alpha=0.7, linewidth=1.5)
             ax.text(icu_rate / 2, 0, f"{icu_rate:.1f}%", ha="center", va="center", color="white", fontsize=16, fontweight="bold", zorder=4)
             ax.set_xlim(0, 100)
             ax.set_ylim(-0.5, 0.5)
             ax.set_yticks([])
-            ax.set_xlabel(f"ICU Occupancy — {icu_occupied}/{icu_total} beds occupied", color="#6B8CAE", fontsize=10)
+            ax.set_xlabel(f"ICU Occupancy — {icu_occupied}/{icu_total} beds occupied", color="#6B7280", fontsize=10)
             for spine in ax.spines.values():
                 spine.set_visible(False)
-            ax.tick_params(colors="#6B8CAE")
+            ax.tick_params(colors="#6B7280")
             fig.tight_layout()
             st.pyplot(fig, use_container_width=True)
             plt.close(fig)
@@ -309,7 +652,7 @@ def main():
                 cls_bed = "bed-occ" if i < icu_occupied else "bed-free"
                 beds_html += f'<div class="{cls_bed}" title="Bed {i+1}"></div>'
             beds_html += "</div>"
-            beds_html += '<div style="margin-top:8px; font-size:0.75rem; color:#6B8CAE;">● Occupied &nbsp; ● Free</div>'
+            beds_html += '<div style="margin-top:8px; font-size:0.75rem; color:#6B7280;">● Occupied &nbsp; ● Free</div>'
             st.markdown(f'<div class="hd-card">{beds_html}</div>', unsafe_allow_html=True)
 
         # Section D: Three gauges
@@ -319,20 +662,20 @@ def main():
         reliability = 100 - noshow_pct
 
         for col, (label, val, color) in [
-            (col_g1, ("ICU Capacity %", icu_rate, "#EF4444" if icu_rate >= 90 else "#F59E0B" if icu_rate >= 70 else "#10B981")),
-            (col_g2, ("Readmission Pressure %", min(100, readmit_pct), "#EF4444" if readmit_pct >= 15 else "#F59E0B" if readmit_pct >= 5 else "#10B981")),
-            (col_g3, ("Appointment Reliability %", reliability, "#EF4444" if reliability < 75 else "#F59E0B" if reliability < 90 else "#10B981")),
+            (col_g1, ("ICU Capacity %", icu_rate, "#DC2626" if icu_rate >= 80 else "#F59E0B" if icu_rate >= 60 else "#16A34A")),
+            (col_g2, ("Readmission Pressure %", min(100, readmit_pct), "#DC2626" if readmit_pct >= 15 else "#F59E0B" if readmit_pct >= 5 else "#16A34A")),
+            (col_g3, ("Appointment Reliability %", reliability, "#DC2626" if reliability < 75 else "#F59E0B" if reliability < 90 else "#16A34A")),
         ]:
             with col:
                 fig, ax = plt.subplots(figsize=(4, 1.5))
-                fig.patch.set_facecolor("#131F35")
-                ax.set_facecolor("#131F35")
+                fig.patch.set_facecolor("#FFFFFF")
+                ax.set_facecolor("#F6F8FB")
                 ax.barh(0, val, color=color, height=0.5, zorder=3)
-                ax.barh(0, 100, color="#1E3A5F", height=0.5, zorder=2)
+                ax.barh(0, 100, color="#E5E7EB", height=0.5, zorder=2)
                 ax.set_xlim(0, 100)
                 ax.set_ylim(-0.5, 0.5)
                 ax.set_yticks([])
-                ax.set_xlabel(label, color="#6B8CAE", fontsize=9)
+                ax.set_xlabel(label, color="#6B7280", fontsize=9)
                 for spine in ax.spines.values():
                     spine.set_visible(False)
                 fig.tight_layout()
@@ -342,25 +685,45 @@ def main():
         # Section E: Alerts feed
         st.markdown('<div class="hd-card-title">ACTIVE ALERTS</div>', unsafe_allow_html=True)
         alerts = []
-        if icu_rate >= 90:
+        if icu_rate >= 80:
             alerts.append(("🚨", "danger", f"ICU CRITICAL: {icu_rate:.0f}% occupancy — escalation recommended"))
-        elif icu_rate >= 70:
+        elif icu_rate >= 60:
             alerts.append(("⚠️", "warning", f"ICU ELEVATED: {icu_rate:.0f}% occupancy — monitor closely"))
         if high_readmit > 100:
             alerts.append(("⚠️", "warning", f"{high_readmit} patients flagged for high readmission risk"))
         if not alerts:
             alerts.append(("✅", "normal", "All systems operating within normal parameters"))
 
-        color_map = {"danger": "#EF4444", "warning": "#F59E0B", "normal": "#10B981"}
+        color_map = {"danger": "#DC2626", "warning": "#F59E0B", "normal": "#16A34A"}
         for icon, level, msg in alerts:
             st.markdown(f"""
             <div style="border-left:3px solid {color_map[level]}; 
                         padding:10px 14px; margin:6px 0;
-                        background:#1A2942; border-radius:0 6px 6px 0;
-                        color:#F0F6FF; font-size:0.9rem;">
+                        background:#FFFFFF; border:1px solid #E5E7EB; border-radius:0 6px 6px 0;
+                        color:#1A1A1A; font-size:0.9rem;">
                 {icon} {msg}
             </div>
             """, unsafe_allow_html=True)
+
+        # Operational Recommendations (LLM)
+        st.markdown("#### Operational Recommendations")
+        try:
+            recs = generate_operational_recommendations(strain)
+            st.info(recs)
+        except Exception:
+            st.warning("AI insights temporarily unavailable.")
+
+        # Predictive ICU forecast (next 12h, 24h, 48h)
+        st.markdown("#### Projected ICU Occupancy")
+        try:
+            icu_trend_df = load_trend_data("icu_occupancy", days_7=True)
+            proj = predict_icu_load(icu_rate, icu_trend_df, icu_total)
+            fc1, fc2, fc3 = st.columns(3)
+            fc1.metric("Next 12h projection", f"{proj['next_12h']:.0f}%", help="Simple linear/rolling projection")
+            fc2.metric("Next 24h projection", f"{proj['next_24h']:.0f}%", help="Based on recent trend")
+            fc3.metric("Next 48h projection", f"{proj['next_48h']:.0f}%", help="Based on recent trend")
+        except Exception as e:
+            st.caption(f"Forecast unavailable: {e}")
 
     # ─── TAB 2: ICU Capacity ──────────────────────────────────────────────
     with tab2:
@@ -374,18 +737,18 @@ def main():
         with row1_left:
             st.markdown('<div class="hd-card-title">ICU CAPACITY GAUGE</div>', unsafe_allow_html=True)
             fig, ax = plt.subplots(figsize=(8, 3))
-            fig.patch.set_facecolor("#131F35")
-            ax.set_facecolor("#131F35")
-            color = "#EF4444" if icu_rate >= 90 else "#F59E0B" if icu_rate >= 70 else "#10B981"
+            fig.patch.set_facecolor("#FFFFFF")
+            ax.set_facecolor("#F6F8FB")
+            color = "#DC2626" if icu_rate >= 80 else "#F59E0B" if icu_rate >= 60 else "#16A34A"
             ax.barh(0, icu_rate, color=color, height=0.5, zorder=3)
-            ax.barh(0, 100, color="#1E3A5F", height=0.5, zorder=2)
-            ax.axvline(x=90, color="#EF4444", linestyle="--", alpha=0.7, linewidth=1.5)
-            ax.axvline(x=70, color="#F59E0B", linestyle="--", alpha=0.7, linewidth=1.5)
+            ax.barh(0, 100, color="#E5E7EB", height=0.5, zorder=2)
+            ax.axvline(x=80, color="#DC2626", linestyle="--", alpha=0.7, linewidth=1.5)
+            ax.axvline(x=60, color="#F59E0B", linestyle="--", alpha=0.7, linewidth=1.5)
             ax.text(icu_rate / 2, 0, f"{icu_rate:.1f}%", ha="center", va="center", color="white", fontsize=18, fontweight="bold", zorder=4)
             ax.set_xlim(0, 100)
             ax.set_ylim(-0.5, 0.5)
             ax.set_yticks([])
-            ax.set_xlabel(f"ICU Occupancy — {icu_occupied}/{icu_total} beds", color="#6B8CAE", fontsize=10)
+            ax.set_xlabel(f"ICU Occupancy — {icu_occupied}/{icu_total} beds", color="#6B7280", fontsize=10)
             for spine in ax.spines.values():
                 spine.set_visible(False)
             fig.tight_layout()
@@ -431,12 +794,12 @@ def main():
                 if "discharges" in trend_df.columns:
                     fig.add_trace(go.Scatter(
                         x=trend_df["date"], y=trend_df["discharges"],
-                        name="Discharges", line=dict(color="#10B981", width=2),
+                        name="Discharges", line=dict(color="#16A34A", width=2),
                         mode="lines+markers", marker=dict(size=5),
                     ))
-                fig.add_hline(y=45, line_dash="dash", line_color="#EF4444", opacity=0.6, annotation_text="Critical (90%)")
+                fig.add_hline(y=45, line_dash="dash", line_color="#DC2626", opacity=0.6, annotation_text="Critical (90%)")
                 fig.add_hline(y=35, line_dash="dash", line_color="#F59E0B", opacity=0.6, annotation_text="Caution (70%)")
-                fig.update_layout(**_plotly_layout(), height=350, title=dict(text="30-Day Admissions & Discharges", font=dict(color="#F0F6FF", size=14)))
+                fig.update_layout(**_plotly_layout(), height=350, title=dict(text="30-Day Admissions & Discharges", font=dict(color="#1A1A1A", size=14)))
                 st.plotly_chart(fig, use_container_width=True)
 
     # ─── TAB 3: High Readmission Risk ─────────────────────────────────────
@@ -466,6 +829,12 @@ def main():
 
         filtered_df = high_risk_df.copy()
         if not filtered_df.empty and "readmission_risk" in filtered_df.columns:
+            risk_min, risk_max = st.session_state.sidebar_risk_min, st.session_state.sidebar_risk_max
+            filtered_df = filtered_df[(filtered_df["readmission_risk"] >= risk_min) & (filtered_df["readmission_risk"] <= risk_max)]
+            if st.session_state.sidebar_readmit_dept != "All":
+                dept_col = next((c for c in filtered_df.columns if "department" in c.lower() or "dept" in c.lower()), None)
+                if dept_col:
+                    filtered_df = filtered_df[filtered_df[dept_col].astype(str) == st.session_state.sidebar_readmit_dept]
             if filter_by == "Critical only (≥80%)":
                 filtered_df = filtered_df[filtered_df["readmission_risk"] >= 0.8]
             elif filter_by == "High (60-80%)":
@@ -480,37 +849,60 @@ def main():
         if filtered_df.empty:
             st.warning("No data available")
         else:
-            cards_html = '<div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(280px,1fr)); gap:12px;">'
-            for _, row in filtered_df.head(50).iterrows():
-                risk = float(row.get("readmission_risk", 0))
-                risk_pct = risk * 100
-                bar_color = "#EF4444" if risk >= 0.8 else "#F59E0B"
-                badge_class = "risk-critical" if risk >= 0.8 else "risk-high"
-                badge_text = "CRITICAL" if risk >= 0.8 else "HIGH RISK"
-                pid = row.get("patient_id", "—")
-                cards_html += f"""
-                <div style="background:#131F35; border:1px solid #1E3A5F; 
-                            border-top:3px solid {bar_color}; border-radius:10px; 
-                            padding:16px;">
-                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-                        <span style="font-family:'DM Mono',monospace; font-size:0.9rem; color:#F0F6FF;">{pid}</span>
-                        <span class="{badge_class}">{badge_text}</span>
-                    </div>
-                    <div style="background:#0B1120; border-radius:4px; height:8px; margin-bottom:8px;">
-                        <div style="background:{bar_color}; width:{min(100, risk_pct):.0f}%; height:8px; border-radius:4px;"></div>
-                    </div>
-                    <div style="color:#6B8CAE; font-size:0.8rem;">Risk: {risk_pct:.1f}%</div>
-                </div>
-                """
-            cards_html += "</div>"
-            st.markdown(cards_html, unsafe_allow_html=True)
+            batch_size = 12
+            rows = filtered_df.head(50)
+            for start in range(0, len(rows), batch_size):
+                batch = rows.iloc[start : start + batch_size]
+                cards_html = '<div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(260px, 1fr)); gap:12px; width:100%;">'
+                for _, row in batch.iterrows():
+                    risk = float(row.get("readmission_risk", 0))
+                    risk_pct = risk * 100
+                    bar_color = "#DC2626" if risk >= 0.8 else "#F59E0B"
+                    badge_class = "risk-critical" if risk >= 0.8 else "risk-high"
+                    badge_text = "CRITICAL" if risk >= 0.8 else "HIGH RISK"
+                    pid = html_module.escape(str(row.get("patient_id", "—")))
+                    bar_pct = min(100, risk_pct)
+                    cards_html += (
+                        f'<div style="background:#FFFFFF; border:1px solid #E5E7EB; border-top:3px solid {bar_color}; border-radius:10px; padding:16px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); min-width:0;">'
+                        f'<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; gap:8px;">'
+                        f'<span style="font-family:\'DM Mono\',monospace; font-size:0.9rem; color:#1A1A1A; overflow:hidden; text-overflow:ellipsis;">{pid}</span>'
+                        f'<span class="{badge_class}" style="flex-shrink:0;">{badge_text}</span>'
+                        f'</div>'
+                        f'<div style="background:#F6F8FB; border-radius:4px; height:8px; margin-bottom:8px; overflow:hidden;">'
+                        f'<div style="background:{bar_color}; width:{bar_pct:.0f}%; height:100%; border-radius:4px; min-width:0;"></div>'
+                        f'</div>'
+                        f'<div style="color:#6B7280; font-size:0.8rem;">Risk: {risk_pct:.1f}%</div>'
+                        f'</div>'
+                    )
+                cards_html += "</div>"
+                st.markdown(cards_html, unsafe_allow_html=True)
+
+        # Root Cause Analysis: Top Drivers of Readmission Risk
+        st.markdown("#### Top Drivers of Readmission Risk")
+        try:
+            drivers = analyze_readmission_drivers(high_risk_df)
+            if drivers.get("top_conditions"):
+                for item in drivers["top_conditions"][:10]:
+                    st.markdown(f"- **{item['name']}** — {item['count']} patients")
+                cond_df = pd.DataFrame(drivers["top_conditions"])
+                st.bar_chart(cond_df.set_index("name")["count"], height=250)
+            if drivers.get("departments"):
+                dept_df = pd.DataFrame(drivers["departments"])
+                st.bar_chart(dept_df.set_index("name")["count"], height=220)
+            if drivers.get("discharge_types"):
+                disc_df = pd.DataFrame(drivers["discharge_types"])
+                st.bar_chart(disc_df.set_index("name")["count"], height=220)
+            if not any([drivers.get("top_conditions"), drivers.get("departments"), drivers.get("discharge_types")]):
+                st.caption("No driver data available (diagnosis/department/discharge columns may be missing).")
+        except Exception as e:
+            st.caption(f"Root cause analysis unavailable: {e}")
 
         # Risk distribution chart
         if not high_risk_df.empty and "readmission_risk" in high_risk_df.columns:
             bins = ["0.6-0.7", "0.7-0.8", "0.8-0.9", "0.9-1.0"]
             ranges = [(0.6, 0.7), (0.7, 0.8), (0.8, 0.9), (0.9, 1.01)]
             counts = [len(high_risk_df[(high_risk_df["readmission_risk"] >= lo) & (high_risk_df["readmission_risk"] < hi)]) for lo, hi in ranges]
-            colors = ["#FEF08A", "#FCD34D", "#F97316", "#EF4444"]
+            colors = ["#FEF08A", "#FCD34D", "#F97316", "#DC2626"]
             fig = go.Figure(go.Bar(x=bins, y=counts, marker_color=colors))
             fig.update_layout(**_plotly_layout(), height=250, title="Risk Score Distribution")
             st.plotly_chart(fig, use_container_width=True)
@@ -539,7 +931,7 @@ def main():
             else:
                 dept_col = "department" if "department" in dept_df.columns else dept_df.columns[0]
                 dept_df = dept_df.sort_values("no_show_rate", ascending=False)
-                colors = ["#EF4444" if r > 0.20 else "#F59E0B" if r > 0.10 else "#10B981" for r in dept_df["no_show_rate"]]
+                colors = ["#DC2626" if r > 0.20 else "#F59E0B" if r > 0.10 else "#16A34A" for r in dept_df["no_show_rate"]]
                 fig = go.Figure(go.Bar(
                     x=dept_df["no_show_rate"] * 100,
                     y=dept_df[dept_col].astype(str).str.capitalize(),
@@ -548,9 +940,11 @@ def main():
                     text=[f"{r*100:.1f}%" for r in dept_df["no_show_rate"]],
                     textposition="outside",
                 ))
-                fig.add_vline(x=20, line_dash="dash", line_color="#EF4444", annotation_text="High risk 20%")
+                fig.add_vline(x=20, line_dash="dash", line_color="#DC2626", annotation_text="High risk 20%")
                 fig.add_vline(x=10, line_dash="dash", line_color="#F59E0B", annotation_text="Moderate 10%")
-                fig.update_layout(**_plotly_layout(), height=300, margin=dict(l=120, r=80), xaxis_title="No-Show Rate (%)")
+                layout = _plotly_layout()
+                layout["margin"] = dict(t=30, b=40, l=120, r=80)
+                fig.update_layout(**layout, height=300, xaxis_title="No-Show Rate (%)")
                 st.plotly_chart(fig, use_container_width=True)
 
         with col_stats:
@@ -614,7 +1008,7 @@ def main():
                     for col in ["readmission_risk", "icu_risk", "no_show_risk"]:
                         if col in risk_scores.columns:
                             val = risk_scores[col].iloc[0]
-                            color = "#EF4444" if val >= 0.8 else "#F59E0B" if val >= 0.5 else "#10B981"
+                            color = "#DC2626" if val >= 0.8 else "#F59E0B" if val >= 0.5 else "#16A34A"
                             label = col.replace("_risk", "").replace("_", " ").title()
                             chip_html += f'<div style="background:{color}22; border:1px solid {color}; color:{color}; padding:6px 14px; border-radius:20px; font-family:monospace; font-size:0.9rem;">{label}: {val:.2f}</div>'
                     chip_html += "</div>"
@@ -626,12 +1020,14 @@ def main():
                     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, subplot_titles=("Heart Rate (bpm)", "SpO2 (%)"))
                     if "heart_rate" in v.columns:
                         fig.add_trace(go.Scatter(y=v["heart_rate"], mode="lines+markers", line=dict(color="#F97316", width=2), name="Heart Rate"), row=1, col=1)
-                        fig.add_hline(y=100, line_dash="dash", line_color="#EF4444", opacity=0.5, row=1, col=1)
-                        fig.add_hline(y=60, line_dash="dash", line_color="#EF4444", opacity=0.5, row=1, col=1)
+                        fig.add_hline(y=100, line_dash="dash", line_color="#DC2626", opacity=0.5, row=1, col=1)
+                        fig.add_hline(y=60, line_dash="dash", line_color="#DC2626", opacity=0.5, row=1, col=1)
                     if "oxygen_saturation" in v.columns:
                         fig.add_trace(go.Scatter(y=v["oxygen_saturation"], mode="lines+markers", line=dict(color="#3B82F6", width=2), name="SpO2"), row=2, col=1)
-                        fig.add_hline(y=95, line_dash="dash", line_color="#EF4444", opacity=0.5, row=2, col=1)
-                    fig.update_layout(**_plotly_layout(), height=350, margin=dict(t=40, b=20), showlegend=False)
+                        fig.add_hline(y=95, line_dash="dash", line_color="#DC2626", opacity=0.5, row=2, col=1)
+                    layout = _plotly_layout()
+                    layout["margin"] = dict(t=40, b=20, l=50, r=20)
+                    fig.update_layout(**layout, height=350, showlegend=False)
                     st.plotly_chart(fig, use_container_width=True)
 
                 admissions = hist.get("admissions", pd.DataFrame())
@@ -643,10 +1039,45 @@ def main():
 
     # ─── TAB 6: Trends ────────────────────────────────────────────────────
     with tab6:
+        # Time-series trends (ICU, Readmission, No-Show)
+        period = st.radio("Trend period", ["Last 7 days", "Last 30 days"], horizontal=True, key="trend_period")
+        days_7 = period == "Last 7 days"
+        st.markdown("#### ICU Occupancy Trend")
+        try:
+            icu_trend = load_trend_data("icu_occupancy", days_7=days_7)
+            if not icu_trend.empty and "date" in icu_trend.columns:
+                st.line_chart(icu_trend.set_index("date")[["value"]], height=250)
+            else:
+                st.caption("No ICU trend data available.")
+        except Exception as e:
+            st.error("Unable to load hospital data.")
+            st.caption(str(e))
+        st.markdown("#### High Readmission Risk Trend")
+        try:
+            readmit_trend = load_trend_data("readmission_risk", days_7=days_7)
+            if not readmit_trend.empty and "date" in readmit_trend.columns:
+                st.line_chart(readmit_trend.set_index("date")[["value"]], height=250)
+            else:
+                st.caption("No readmission trend data available.")
+        except Exception as e:
+            st.error("Unable to load hospital data.")
+            st.caption(str(e))
+        st.markdown("#### Appointment No-Show Trend")
+        try:
+            noshow_trend = load_trend_data("no_show", days_7=days_7)
+            if not noshow_trend.empty and "date" in noshow_trend.columns:
+                st.line_chart(noshow_trend.set_index("date")[["value"]], height=250)
+            else:
+                st.caption("No no-show trend data available.")
+        except Exception as e:
+            st.error("Unable to load hospital data.")
+            st.caption(str(e))
+        st.markdown("---")
+        st.markdown("#### Admissions & Discharges (60-day)")
         try:
             trend_df = load_trend(60)
         except Exception as e:
-            st.error(f"Failed to load: {e}")
+            st.error("Unable to load hospital data.")
             trend_df = pd.DataFrame()
 
         c1, c2, c3 = st.columns(3)
@@ -664,7 +1095,7 @@ def main():
             if metric in ("Both", "Admissions only") and "admissions" in trend_df.columns:
                 fig.add_trace(go.Scatter(x=trend_df["date"], y=trend_df["admissions"], name="Admissions", fill="tozeroy", fillcolor="rgba(59,130,246,0.15)", line=dict(color="#3B82F6", width=2), mode="lines+markers"))
             if metric in ("Both", "Discharges only") and "discharges" in trend_df.columns:
-                fig.add_trace(go.Scatter(x=trend_df["date"], y=trend_df["discharges"], name="Discharges", line=dict(color="#10B981", width=2), mode="lines+markers"))
+                fig.add_trace(go.Scatter(x=trend_df["date"], y=trend_df["discharges"], name="Discharges", line=dict(color="#16A34A", width=2), mode="lines+markers"))
             if show_ma and "admissions" in trend_df.columns and len(trend_df) >= 7:
                 ma = trend_df["admissions"].rolling(7, min_periods=1).mean()
                 fig.add_trace(go.Scatter(x=trend_df["date"], y=ma, name="7-day avg", line=dict(color="#F59E0B", width=1.5, dash="dash")))
@@ -674,9 +1105,9 @@ def main():
             # Net flow chart
             discharges = trend_df["discharges"] if "discharges" in trend_df.columns else pd.Series(0, index=trend_df.index)
             net = trend_df["admissions"] - discharges
-            colors = ["#10B981" if n <= 0 else "#EF4444" for n in net]
+            colors = ["#16A34A" if n <= 0 else "#DC2626" for n in net]
             fig2 = go.Figure(go.Bar(x=trend_df["date"], y=net, marker_color=colors))
-            fig2.add_hline(y=0, line_color="#6B8CAE", line_width=1)
+            fig2.add_hline(y=0, line_color="#E5E7EB", line_width=1)
             fig2.update_layout(**_plotly_layout(), height=250, title="Net Daily Patient Flow (Admissions − Discharges)")
             st.plotly_chart(fig2, use_container_width=True)
 
@@ -734,7 +1165,7 @@ def main():
         for q, a in reversed(st.session_state.ai_history):
             st.markdown(f"""
             <div style="text-align:right; margin:8px 0;">
-                <div style="display:inline-block; background:#1D4ED8; color:#fff; 
+                <div style="display:inline-block; background:#3A7BD5; color:#fff; 
                             padding:10px 16px; border-radius:12px; 
                             max-width:75%; font-size:0.9rem;">{q}</div>
             </div>
@@ -743,24 +1174,22 @@ def main():
             content = '<ul style="margin:0; padding-left:18px;">' + "".join(f'<li style="margin-bottom:4px;">{l}</li>' for l in lines) + "</ul>" if len(lines) > 1 else f'<p style="margin:0;">{a}</p>'
             st.markdown(f"""
             <div style="text-align:left; margin:8px 0;">
-                <div style="display:inline-block; background:#1A2942; 
-                            border:1px solid #1E3A5F; color:#F0F6FF;
+                <div style="display:inline-block; background:#FFFFFF; 
+                            border:1px solid #E5E7EB; color:#1A1A1A;
                             padding:12px 16px; border-radius:12px;
                             max-width:85%; font-size:0.9rem;">{content}</div>
             </div>
             """, unsafe_allow_html=True)
 
-    # ─── Sidebar (optional debug) ──────────────────────────────────────────
-    with st.sidebar:
-        st.markdown("### Debug")
-        show_debug = st.checkbox("Show raw data", False)
-        if show_debug:
+    # Debug already in sidebar above
+    if show_debug:
+        with st.sidebar:
             st.json(strain)
 
     # ─── Footer ────────────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown(
-        f'<div style="text-align:center; color:#6B8CAE; font-size:0.75rem; padding:8px;">'
+        f'<div style="text-align:center; color:#6B7280; font-size:0.75rem; padding:8px;">'
         f'⚠️ Demo data as of {strain.get("data_as_of", "unknown")} &nbsp;|&nbsp; '
         f"Hospital Digital Twin &nbsp;|&nbsp; "
         f'Supabase {"✓" if os.environ.get("SUPABASE_URL") else "✗"}'

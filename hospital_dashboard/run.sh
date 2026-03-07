@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
-# Run the hospital dashboard using the project's .venv (no need to activate manually)
+# Run the Streamlit hospital dashboard (use project venv if present)
 cd "$(dirname "$0")"
-exec .venv/bin/python -m shiny run app.py "$@"
+if [ -d ".venv" ]; then
+  exec .venv/bin/streamlit run streamlit_dashboard.py "$@"
+else
+  exec streamlit run streamlit_dashboard.py "$@"
+fi

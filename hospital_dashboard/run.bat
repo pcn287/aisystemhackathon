@@ -1,4 +1,8 @@
 @echo off
-REM Run the hospital dashboard using the project's .venv (no need to activate manually)
+REM Run the Streamlit hospital dashboard (use project venv if present)
 cd /d "%~dp0"
-.venv\Scripts\python.exe -m shiny run app.py %*
+if exist ".venv\Scripts\streamlit.exe" (
+  .venv\Scripts\streamlit.exe run streamlit_dashboard.py %*
+) else (
+  streamlit run streamlit_dashboard.py %*
+)

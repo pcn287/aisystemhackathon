@@ -284,3 +284,100 @@ def answer_user_question(question: str, data_context: dict) -> str:
         return _cached_call(key, _do)
     except Exception as e:
         return f"AI temporarily unavailable: {e}"
+
+
+def generate_operational_recommendations(summary_data: dict) -> str:
+    """
+    LLM-generated actionable recommendations for hospital administrators.
+    summary_data should include: icu_occupancy (or icu_rate, icu_occupied, icu_total),
+    high_readmission_count, likely_no_show_count (or similar).
+    """
+    if not _AI_AVAILABLE:
+        return (
+            "AI recommendations unavailable — check OPENAI_API_KEY. "
+            "Review ICU capacity, high readmission list, and no-show risk in the dashboard."
+        )
+    try:
+        def _do():
+            user_content = (
+                "You are a hospital operations assistant.\n\n"
+                "Given these hospital metrics:\n"
+                f"ICU occupancy: {summary_data.get('icu_rate', summary_data.get('icu_occupancy', 0)) * 100:.0f}% "
+                f"({summary_data.get('icu_occupied', 0)}/{summary_data.get('icu_total', 50)} beds)\n"
+                f"High readmission patients: {summary_data.get('high_readmission_count', 0)}\n"
+                f"Likely no-shows: {summary_data.get('likely_no_show_count', summary_data.get('likely_noshows', 0))}\n\n"
+                "Provide 3 actionable operational recommendations that hospital administrators should take today. "
+                "Each recommendation should include: action, reason, and expected impact. "
+                "Use short bullet points; be specific and practical."
+            )
+            return _call_llm(_SYSTEM_PROMPT, user_content, max_tokens=800)
+
+        key = "recs:" + json.dumps({k: summary_data.get(k) for k in ("icu_rate", "high_readmission_count", "likely_no_show_count")}, sort_keys=True)
+        return _cached_call(key, _do)
+    except Exception as e:
+        return f"AI temporarily unavailable: {e}"
+
+
+def generate_situation_brief(summary_data: dict) -> str:
+    """
+    One-paragraph executive summary of the whole dashboard (ICU, readmission, no-show, strain).
+    Hospital executives use this as the AI Hospital Situation Brief.
+    """
+    if not _AI_AVAILABLE:
+        icu = summary_data.get("icu_occupied", 0)
+        total = summary_data.get("icu_total", 50)
+        return (
+            f"ICU at {icu}/{total} beds. "
+            "AI situation brief unavailable — check OPENAI_API_KEY."
+        )
+    try:
+        def _do():
+            user_content = (
+                "You are a hospital operations assistant. Summarize the current hospital situation in ONE short paragraph "
+                "(3–5 sentences) for executives. Include: ICU occupancy and trend, readmission risk level, no-show risk, "
+                "and one or two immediate priorities (e.g. bed management, follow-up outreach). "
+                "Use ONLY the numbers provided; do not invent data. Be concise and actionable.\n\n"
+                + json.dumps(summary_data, default=str)
+            )
+            return _call_llm(_SYSTEM_PROMPT, user_content, max_tokens=400)
+
+        key = "brief:" + json.dumps(summary_data, default=str, sort_keys=True)[:600]
+        return _cached_call(key, _do)
+    except Exception as e:
+        return f"AI temporarily unavailable: {e}"
+
+
+def patient_digital_twin_insight(patient_id: str | int, history: dict) -> str:
+    """
+    LLM interpretation for Patient Digital Twin: readmission probability, risk factors, suggested follow-up.
+    """
+    if not _AI_AVAILABLE:
+        return (
+            f"Patient {patient_id}: AI insight unavailable — check OPENAI_API_KEY. "
+            "Use risk scores and vitals in the dashboard."
+        )
+    try:
+        def _do():
+            rs = history.get("risk_scores")
+            risk_records = _as_list(rs)
+            data = {
+                "patient_id": patient_id,
+                "demographics": history.get("demographics", {}),
+                "admissions_count": _safe_len(history.get("admissions")),
+                "vitals_count": _safe_len(history.get("vitals")),
+                "risk_scores": risk_records,
+            }
+            user_content = (
+                "You are a clinical risk assistant. Given the following patient data, explain:\n"
+                "1. Readmission probability (use risk_scores if present)\n"
+                "2. Key clinical risk factors\n"
+                "3. Suggested follow-up intervention\n\n"
+                "Do not invent numbers. Use only the data below.\n\n"
+                + json.dumps(data, default=str)
+            )
+            return _call_llm(_SYSTEM_PROMPT, user_content, max_tokens=600)
+
+        key = f"twin:{patient_id}:{len(history.get('admissions', []))}"[:150]
+        return _cached_call(key, _do)
+    except Exception as e:
+        return f"AI temporarily unavailable: {e}"
