@@ -570,6 +570,79 @@ def get_department_no_show_rates() -> pd.DataFrame:
     return out
 
 
+def get_icu_patients(limit: int = 200) -> pd.DataFrame:
+    """
+    Return patients currently in ICU (from icu_beds where patient_id is present).
+    Merges with patients and risk_scores for display.
+    """
+    beds = get_icu_beds()
+    patients = get_patients()
+    risk_scores = get_risk_scores()
+    _log_df("Analytics", "get_icu_patients (icu_beds)", beds)
+    if beds is None or beds.empty:
+        return pd.DataFrame()
+    pid_col = "patient_id" if "patient_id" in beds.columns else None
+    if not pid_col:
+        return pd.DataFrame()
+    occ_col = "occupied" if "occupied" in beds.columns else "status"
+    if occ_col in beds.columns:
+        if beds[occ_col].dtype == bool:
+            occupied = beds[beds[occ_col]].copy()
+        else:
+            occupied = beds[beds[occ_col].astype(str).str.lower().isin(("true", "1", "occupied", "yes"))].copy()
+    else:
+        occupied = beds[beds[pid_col].notna()].copy()
+    if occupied.empty:
+        occupied = beds[beds[pid_col].notna()].copy()
+    if occupied.empty:
+        return pd.DataFrame()
+    pids = occupied[pid_col].astype(str).unique().tolist()[:limit]
+    if not pids:
+        return pd.DataFrame()
+    out = patients[patients["patient_id"].astype(str).isin(pids)].copy() if not patients.empty and "patient_id" in patients.columns else pd.DataFrame(columns=["patient_id"])
+    if out.empty:
+        out = pd.DataFrame([{"patient_id": pid} for pid in pids])
+    if not risk_scores.empty and "patient_id" in risk_scores.columns:
+        rs = risk_scores[risk_scores["patient_id"].astype(str).isin(pids)].drop_duplicates(subset=["patient_id"], keep="first")
+        out = out.merge(rs, on="patient_id", how="left", suffixes=("", "_rs"))
+        out = out[[c for c in out.columns if not c.endswith("_rs")]]
+    _log_df("Analytics", "get_icu_patients result", out)
+    return out
+
+
+def get_patient_list_for_dashboard(limit: int = 500) -> pd.DataFrame:
+    """
+    Return patient list for drill-down view: patients merged with risk_scores.
+    Columns: patient_id, age, gender, diagnosis, heart_rate, blood_pressure, oxygen,
+    icu_status, readmission_risk, no_show_risk (when available).
+    """
+    patients = get_patients()
+    risk_scores = get_risk_scores()
+    beds = get_icu_beds()
+    _log_df("Analytics", "get_patient_list_for_dashboard (patients)", patients)
+    if patients is None or patients.empty:
+        return pd.DataFrame()
+    out = patients.head(limit).copy()
+    if not risk_scores.empty and "patient_id" in risk_scores.columns:
+        rs = risk_scores.drop_duplicates(subset=["patient_id"], keep="first")
+        merge_cols = ["patient_id"] + [c for c in rs.columns if c != "patient_id"]
+        out = out.merge(rs[merge_cols], on="patient_id", how="left", suffixes=("", "_rs"))
+        out = out[[c for c in out.columns if not c.endswith("_rs")]]
+    if beds is not None and not beds.empty and "patient_id" in beds.columns:
+        occ_col = "occupied" if "occupied" in beds.columns else "status"
+        icu_pids = set()
+        if occ_col in beds.columns:
+            occ_beds = beds[beds[occ_col].fillna(False).astype(bool)] if beds[occ_col].dtype == bool else beds[beds[occ_col].astype(str).str.lower().isin(("true", "1", "occupied", "yes"))]
+            icu_pids = set(occ_beds["patient_id"].dropna().astype(str))
+        else:
+            icu_pids = set(beds["patient_id"].dropna().astype(str))
+        out["icu_status"] = out["patient_id"].astype(str).map(lambda x: "Yes" if x in icu_pids else "No")
+    else:
+        out["icu_status"] = "Unknown"
+    _log_df("Analytics", "get_patient_list_for_dashboard result", out)
+    return out
+
+
 def get_patient_id_list(max_ids: int = 500) -> list[str]:
     """
     Return sorted list of patient IDs for selectors (e.g. dashboard dropdown).
