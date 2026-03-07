@@ -6,6 +6,11 @@ Uses Supabase REST API directly (no supabase package - avoids build issues on Wi
 
 Usage:
     python import_csv_to_supabase.py
+
+To REFRESH after changing the dataset:
+    1. Put your updated CSVs in this folder (Dataset for Hackathon)
+    2. Run supabase_refresh.sql in Supabase Dashboard > SQL Editor (clears all data)
+    3. Run: python import_csv_to_supabase.py
 """
 
 import os
