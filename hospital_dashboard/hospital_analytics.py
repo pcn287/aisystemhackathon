@@ -23,6 +23,7 @@ from database_connection import (
     get_patients,
     get_admissions,
     get_vitals,
+    get_vitals_for_patient,
     get_appointments,
     get_icu_beds,
     get_risk_scores,
@@ -89,7 +90,15 @@ def get_high_readmission_patients(limit: int = 20) -> pd.DataFrame:
     patients = get_patients()
     admissions = get_admissions()
 
-    # Prefer stored readmission risk scores
+    # Schema with readmission_risk column (our Supabase schema)
+    if not risk_df.empty and "readmission_risk" in risk_df.columns and "patient_id" in risk_df.columns:
+        out = risk_df[risk_df["readmission_risk"] >= READMISSION_RISK_THRESHOLD].copy()
+        out = out.sort_values("readmission_risk", ascending=False).head(limit)
+        if not patients.empty and "patient_id" in patients.columns:
+            out = out.merge(patients, on="patient_id", how="left")
+        return out
+
+    # Alternative schema: score_type + value
     if not risk_df.empty and "score_type" in risk_df.columns and "patient_id" in risk_df.columns:
         readmission = risk_df[risk_df["score_type"].astype(str).str.lower().str.contains("readmission", na=False)]
         if not readmission.empty:
@@ -141,6 +150,14 @@ def get_likely_no_shows(days_ahead: int = 1) -> pd.DataFrame:
     upcoming = appointments[(appointments[date_col].dt.date >= today.date()) & (appointments[date_col].dt.date <= end.date())]
 
     risk_df = get_risk_scores()
+    # Schema with no_show_risk column (our Supabase schema)
+    if not risk_df.empty and "no_show_risk" in risk_df.columns and "patient_id" in risk_df.columns:
+        no_show_risk = risk_df[["patient_id", "no_show_risk"]].copy()
+        upcoming = upcoming.merge(no_show_risk, on="patient_id", how="left")
+        upcoming["no_show_risk"] = upcoming["no_show_risk"].fillna(0)
+        upcoming = upcoming.sort_values("no_show_risk", ascending=False)
+        return upcoming
+    # Alternative schema: score_type + value
     if not risk_df.empty and "score_type" in risk_df.columns:
         no_show = risk_df[risk_df["score_type"].astype(str).str.lower().str.contains("no_show|noshow", na=False, regex=True)]
         if not no_show.empty and "patient_id" in no_show.columns:
@@ -207,17 +224,20 @@ def get_department_no_show_rates() -> pd.DataFrame:
 
     dept_col = next((c for c in appointments.columns if "department" in c.lower() or "dept" in c.lower()), None)
     status_col = next((c for c in appointments.columns if "status" in c.lower() or "outcome" in c.lower()), None)
+    no_show_col = "no_show" if "no_show" in appointments.columns else None
 
     if not dept_col:
         dept_col = "department"
         appointments = appointments.copy()
         appointments[dept_col] = "Unknown"
 
-    if not status_col:
-        return appointments.groupby(dept_col).size().reset_index(name="total_appointments")
-
     appointments = appointments.copy()
-    appointments["_no_show"] = appointments[status_col].astype(str).str.lower().str.contains("no.show|noshow|cancel|no-show", na=False, regex=True)
+    if no_show_col:
+        appointments["_no_show"] = appointments[no_show_col].fillna(False).astype(bool)
+    elif status_col:
+        appointments["_no_show"] = appointments[status_col].astype(str).str.lower().str.contains("no.show|noshow|cancel|no-show", na=False, regex=True)
+    else:
+        return appointments.groupby(dept_col).size().reset_index(name="total_appointments")
     agg = appointments.groupby(dept_col).agg(total=("_no_show", "count"), no_shows=("_no_show", "sum")).reset_index()
     agg["no_show_rate"] = (agg["no_shows"] / agg["total"]).round(4)
     agg = agg.sort_values("no_show_rate", ascending=False)
@@ -228,10 +248,10 @@ def get_patient_history(patient_id: str | int) -> dict[str, Any]:
     """
     Return consolidated patient history: demographics, vitals, admissions, risk scores.
     Formatted for the Patient Digital Twin Viewer.
+    Uses filtered vitals fetch (avoids loading 120k+ rows).
     """
     patients = get_patients()
     admissions = get_admissions()
-    vitals = get_vitals()
     risk_scores = get_risk_scores()
 
     pid = str(patient_id) if patient_id is not None else None
@@ -248,7 +268,6 @@ def get_patient_history(patient_id: str | int) -> dict[str, Any]:
 
     patients = _norm_id(patients)
     admissions = _norm_id(admissions)
-    vitals = _norm_id(vitals)
     risk_scores = _norm_id(risk_scores)
 
     demographics = {}
@@ -258,7 +277,7 @@ def get_patient_history(patient_id: str | int) -> dict[str, Any]:
             demographics = row.iloc[0].to_dict()
 
     adm = admissions[admissions["patient_id"] == pid] if not admissions.empty else pd.DataFrame()
-    vit = vitals[vitals["patient_id"] == pid] if not vitals.empty else pd.DataFrame()
+    vit = get_vitals_for_patient(pid)  # filtered fetch - only this patient's vitals
     if not vit.empty and "_date" not in vit.columns:
         date_cand = [c for c in vit.columns if "date" in c.lower() or "time" in c.lower() or "recorded" in c.lower()]
         if date_cand:

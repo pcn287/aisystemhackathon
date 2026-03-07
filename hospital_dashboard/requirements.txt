@@ -1,9 +1,10 @@
 # Patient Digital Twin Hospital Intelligence Dashboard
 # Run from hospital_dashboard: shiny run app.py
-# Set env: SUPABASE_URL, SUPABASE_KEY; optional: OPENAI_API_KEY, OPENAI_BASE_URL, LLM_MODEL
+# Set env: SUPABASE_URL, SUPABASE_KEY (or SUPABASE_SERVICE_ROLE_KEY); optional: OPENAI_API_KEY, OPENAI_BASE_URL, LLM_MODEL
 
 pandas>=2.0.0
-supabase>=2.0.0
+requests>=2.28.0
+python-dotenv>=1.0.0
 shiny>=1.0.0
 openai>=1.0.0
 matplotlib>=3.7.0
