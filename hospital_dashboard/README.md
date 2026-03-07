@@ -2,6 +2,10 @@
 
 Streamlit dashboard for hospital operations: ICU capacity, readmission risk, no-show risk, trends, forecasting, and LLM-powered recommendations. Data from Supabase (PostgreSQL).
 
+**Full documentation:** See **[DOCUMENTATION.md](DOCUMENTATION.md)** for how each function works, parameters, return values, and where to find everything in the codebase.
+
+**All-in-one guide (demo + functions + architecture):** **[Hospital_Dashboard_Guide.md](Hospital_Dashboard_Guide.md)** — also available as **Hospital_Dashboard_Guide.docx** (Word).
+
 ## Structure
 
 ```
