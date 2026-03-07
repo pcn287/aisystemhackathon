@@ -343,4 +343,4 @@ flowchart LR
 | **2. Documentation** | Function-level reference: purpose, inputs, parameters, and return values for database_connection, hospital_analytics, data_queries, analytics, forecasting, hospital_ai_agent, and streamlit_dashboard. |
 | **3. Architecture** | Mermaid diagrams: high-level flow, sequence for Command Center, module dependencies, and mapping from test CSVs to Supabase to dashboard tabs. |
 
-For full variable-level dataset details, see **Dataset for Hackathon/CODEBOOK.md**. For the complete function reference, see **hospital_dashboard/DOCUMENTATION.md**.
+For full variable-level dataset details (codebook), see **Dataset for Hackathon/README.md**. For the complete function reference, see **hospital_dashboard/DOCUMENTATION.md**.

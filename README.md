@@ -16,7 +16,7 @@ See **hospital_dashboard/README.md** for full setup and structure.
 ## Repo layout
 
 - **hospital_dashboard/** – Streamlit app and all backend (analytics, DB, LLM, forecasting).
-- **Dataset for Hackathon/** – Sample CSVs and scripts to load data into Supabase (optional).
+- **Dataset for Hackathon/** – README (dataset + codebook) and scripts to generate/import data into Supabase (optional).
 - **supabase_schema.sql** – Reference schema for Supabase tables.
 
 ## License
