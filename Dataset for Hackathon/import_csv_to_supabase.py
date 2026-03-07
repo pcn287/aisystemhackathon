@@ -14,12 +14,13 @@ from pathlib import Path
 from dotenv import load_dotenv
 import requests
 
-# Load environment variables
+# Load environment variables (script is inside Dataset for Hackathon folder)
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
-DATASET_DIR = Path(__file__).parent / "Dataset for Hackathon"
+DATASET_DIR = Path(__file__).parent  # CSVs are in same folder as this script
 BATCH_SIZE = 500  # Insert in batches to avoid timeouts
 
 
